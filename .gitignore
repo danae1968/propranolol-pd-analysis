@@ -1,0 +1,29 @@
+# ---- Data: never commit (sensitive patient data) ----
+Data/
+data/
+*.csv
+*.xls
+*.xlsx
+*.RData
+*.rds
+*.mat
+*.edf
+
+# ---- Analysis outputs ----
+figures/
+*.html
+*.pdf
+*.png
+
+# ---- R / RStudio ----
+.Rproj.user/
+.Rhistory
+.RData
+.Ruserdata
+*.Rproj
+*_cache/
+*_files/
+
+# ---- OS ----
+.DS_Store
+Thumbs.db

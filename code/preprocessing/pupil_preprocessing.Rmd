@@ -1,0 +1,259 @@
+---
+title: "Pupil preprocessing: trackloss, blink interpolation and smoothing"
+author: "Danae Papadopetraki"
+output: html_document
+---
+
+<!--
+Upstream preprocessing of the eye-tracking data: screens trackloss, interpolates
+blinks and smooths the raw pupil signal (via the `gazer` / `saccades` toolchain and
+the local `pupInterp()` helper), producing the per-trial pupil traces used by the
+analysis notebook (../drug_effects.Rmd). Raw eye-tracking data are not public (see README).
+-->
+
+
+
+## install packages (only needed once)
+
+```{r include=FALSE}
+rm(list=ls()) 
+#install.packages('devtools')
+# library(devtools)
+# remotes::install_github("dmirman/gazer")
+# #installs gazer package from github
+# remotes::install_github("tmalsburg/saccades/saccades")
+# remotes::install_version("nloptr", version = "1.2.2.3") #to solve nloptr error
+# #install saccades package from github Needed the master version
+# remotes::install_github("jashubbard/edfR")
+#install package if using edfs from SR
+
+#library('gazer')
+library('saccades')
+library('tidyverse')
+library(zoo)
+library(knitr)
+library('ggpubr')
+library('Rmisc')
+```
+
+```{r setup, include=FALSE}
+# Data root (the raw eye-tracking / behavioural files live under here; not public).
+# Defaults to the working directory; override with the PDPHARM_DIR environment variable.
+projectDir <- Sys.getenv("PDPHARM_DIR", unset = getwd())
+
+source("pupInterp.R")   # local blink-interpolation / smoothing helper (same folder)
+
+
+results_dir <- file.path(projectDir,'results','beh','CW', 'Colorwheel')
+results_dir_g <- file.path(projectDir, 'results','beh','CW')
+
+cw_data <- read.csv(file.path(results_dir_g,'Colorwheel','rawDatamat.csv'), header = F)
+cw_names <- c('subject', 'session', 'dev','rt', 'setSize', 'type', 'col_pie','lureDif','thetaCorrect','tau','thetaLure' ,'signedDev','trial','block')
+names(cw_data) <- cw_names
+type_order <- cw_data %>% dplyr::filter(subject == 2, session ==1) %>% dplyr::select(type,setSize)
+
+#data=read.csv(file=directory,header=T,sep=',') 
+#data=readMat(directory)
+gaze_raw <- data.table::fread(file.path(results_dir,'rawPupil.csv')) # reads in large datasets quickly
+#rename according to gazer requirements
+gaze_raw <- gaze_raw %>% rename(x = xPos, y = yPos, subject = subNo)
+
+gaze_data <- as_tibble(gaze_raw)
+```
+
+
+## data loss
+determines the on/off screen status of each sample, computes the proportion of trackloss by trial and participant, and filters out trials and subjects that pass a user-defined threshold (this filtering can be omitted by setting the threshold to 1.0)
+
+```{r, echo=FALSE}
+screenX <- 1920
+screenY <- 1080
+samplingRateHz <- 500
+
+# function requires time to consistently increase, while we have some inconsistencies. I artificially adapted it to increase by 2 till the end of the matrix
+gaze_data$time <- seq(2,2*dim(gaze_data)[1],2)
+#fix trial repetition so that trial goes from 1 to 64
+gaze_data$trial[gaze_data$block == 2] <- gaze_data$trial[gaze_data$block == 2] + max(gaze_data$trial)
+#turns 0s to Nan
+gaze_data$pupil[gaze_data$pupil == 0] <- NA
+
+#removes participants for whom data is missing based on threshold.
+pup_missing <- count_missing_pupil(gaze_data, missingthresh = .3)
+
+
+```
+
+Remove values based on histogram (Mathot) move this step higher up: figure out if and when this step is necessary. Interpolation does not work well if this done first, so do not run
+
+```{r}
+puphist <- ggplot(pup_missing, aes(x = pupil)) + geom_histogram(aes(y = ..count..),
+    colour = "green", binwidth = 0.5)  + ylim(0,5000)+
+    xlab("Pupil Size") + ylab("Count") + theme_bw() + geom_vline(xintercept = 2500, linetype="dotted") +geom_vline(xintercept = 6200, linetype="dotted")
+print(puphist)
+
+pup_outliers<-pup_missing %>% filter (pupil > 2000 & pupil < 6000) # based on visual inspection
+
+pup_sdabovebelow<-pup_outliers %>% group_by(subject,session, trial) %>% mutate(pupilmeanabove=mean(pupil, na.rm=TRUE)+ 3*sd(pupil, na.rm=TRUE), pupilmeanbelow=mean(pupil, na.rm=TRUE)-3*sd(pupil, na.rm=TRUE))
+pup_sd1<-pup_sdabovebelow %>% subset(pup_sdabovebelow$pupil< pup_sdabovebelow$pupilmeanabove & pup_sdabovebelow$pupil > pup_sdabovebelow$pupilmeanbelow)
+
+```
+Data driven gaze correction
+
+```{r echo=TRUE}
+pup_missing$pupil[is.na(pup_missing$pupil)] <- 0 #turn back to 0, so I don't have to change pupInterp
+#model <- lmer(pupil~ x + y +(1|subject), data=pup_missing)
+mod = lm(pupil ~ x + y, data = pup_missing)#Create the linear regression
+summary(mod)
+pup_missing$pup_resi <- mod$residuals
+
+for (n in 1:32){
+a <- pup_missing %>% filter(subject == 34, session ==1, trial==n)
+plot(a$pupil, pch = 16, col = "red", ylim=c(0,9000))
+points(a$pup_resi, col = 'green')
+}
+```
+gazer interpolation NOT INCLUDED
+```{r eval=FALSE, include=FALSE}
+pup_extend<- pup_missing %>% group_by(subject, session, trial) %>% mutate(extendpupil=extend_blinks(pupil, fillback=50, fillforward=50))
+pup_interp<-interpolate_pupil(pup_extend, extendblinks=TRUE)
+
+```
+
+interpolation based on hershman
+
+```{r}
+
+pup_missing$pup_interp <- NA
+#pup_missing$pupil[is.na(pup_missing$pupil)] <- 0 #turn back to 0, so I don't have to change pupInterp
+pup_missing$pup_resi[pup_missing$pupil == 0] <- 0
+
+msToSmooth <- 10 
+pup_type <- 'resi' #interpolate raw pupil or residuals?
+pup_missing$pup_interp <- pupInterp(pup_missing, samplingRateHz, 'linear', msToSmooth)
+
+```
+Plot to check progress of interpolation #check sub 34, trial 8/9/13 for better smoothing> Problem when blink starts or ends with blink?
+```{r}
+
+trialEx = 10
+subEx=1
+
+for (subEx in unique(pup_missing$subject)){
+  sub_dat <- pup_missing %>% filter( subject == subEx & session ==1)
+for(trialEx in unique(sub_dat$trial)){plot(sub_dat$pupil[sub_dat$trial==trialEx],col='red',ylim=c(0,6000), main = sprintf(' subject %d trial %d',subEx,trialEx))
+        points(sub_dat$pup_interp[sub_dat$trial==trialEx])}
+}
+```
+
+smothing various ways to do it: figure out which kind of smoothing
+```{r}
+smooth_data <- pup_missing
+samplesToSmoothFin <- 100 #ask roshan!
+smooth_data$smooth_pup <- moving_average_pupil(smooth_data$pup_interp, n = samplesToSmoothFin, centered = TRUE)
+
+a=smooth_data[smooth_data$subject == 34 & smooth_data$trial == 9, ]
+plot(a$time, a$pup_interp,col='red',ylim=c(0,6000))
+lines(a$time, a$smooth_pup,col='green')
+
+
+
+for (subEx in unique(smooth_data$subject)){
+  sub_dat <- smooth_data %>% filter( subject == subEx & session ==1)
+for(trialEx in unique(sub_dat$trial))
+  {plot( sub_dat$pupil[sub_dat$trial==trialEx],col='red',ylim=c(-3000,6000), main = sprintf(' subject %d trial %d',subEx,trialEx))
+        lines( sub_dat$smooth_pup[sub_dat$trial==trialEx])}
+}
+#hanning_filter(data$pupil,10)
+
+
+#lowpass.spline <- smooth.spline(smooth_data$time,smooth_data$pup_interp, spar = 0.5) ## Control spar for amount of smoothing
+#lowpass.loess <- loess(y ~ x, data = data.frame(x = x, y = y), span = 0.3) ## control span to define the amount of smoothing1
+##a=smooth_data[smooth_data$subject == 34 & smooth_data$trial == 13, ]
+#y=a$pup_interp
+ #x=a$time
+
+#plot(x,y,ylim=c(0,6000))
+#lines(predict(lowpass.spline, x), col = "red", lwd = 2)
+#lines(predict(lowpass.loess, x), col = "red", lwd = 4)
+
+ save('smooth_data',file=file.path(results_dir,'smooth_pupil_data.RData'))
+
+```
+Z score pupil
+```{r}
+
+smooth_data<- smooth_data%>% dplyr::group_by(subject)%>%
+  dplyr::mutate(pupil_z = (smooth_pup - mean(smooth_pup)) / sd(smooth_pup))
+```
+Mathot histogram again
+```{r}
+puphist <- ggplot(smooth_data, aes(x = pupil_z)) + geom_histogram(aes(y = ..count..),
+    colour = "green", binwidth = 0.5)  + 
+    xlab("Pupil Size") + ylab("Count") + theme_bw() 
+print(puphist)
+
+```
+
+Add condition
+```{r}
+smooth_data <-smooth_data %>% dplyr::group_by(trial) %>% mutate(type = type_order$type[trial], setSize = type_order$setSize[trial])%>% mutate(type = recode(type, '0' = 'Ignore', '2' = 'Update'))
+ save('smooth_data',file=file.path(results_dir,'smooth_pupil_data.RData'))
+
+```
+summary
+```{r}
+pup_sum_phase <- smooth_data %>% dplyr::group_by(subject,session,trial,phase,type) %>% dplyr::summarise(mean_pup = mean(pupil_z), max_pup = max(pupil_z))
+
+pup_sum <- pup_sum_phase %>% dplyr::group_by(subject,session,phase) %>% dplyr::summarise(mean_pup = mean(mean_pup), max_pup = max(max_pup))
+
+pup_sum_type <- pup_sum_phase %>% dplyr::group_by(subject,session,phase,type) %>% dplyr::summarise(mean_pup = mean(mean_pup), max_pup = max(max_pup))
+
+
+phase_labels <- c('encoding','delay','interference')
+#pup_sum <- pup_sum %>% dplyr::mutate(phase = recode(phase, '1' = 'encoding', '2' = 'delay', '3' = 'interference'))
+
+sur3 <- ggplot(pup_sum %>% dplyr::filter(session == 1),aes(y=mean_pup, x=factor(phase),fill=factor(phase)))+ geom_boxplot()+geom_jitter()+ theme_classic() + labs(y = "Mean pupil size (z-scored)") + theme(axis.title=element_text(face="bold",size=12))+ scale_x_discrete('Task phase',labels = phase_labels)+
+  theme(axis.title = element_text(size = 17),axis.text = element_text(size = 16),legend.position="none")+ scale_fill_brewer(palette="Dark2")
+
+sur4 <- ggplot(pup_sum %>% dplyr::filter(session == 1),aes(y=max_pup, x=factor(phase),fill=factor(phase)))+ geom_boxplot()+geom_jitter()+ theme_classic() + labs(y = "Max pupil size (z-scored)") + theme(axis.title=element_text(face="bold",size=12))+ scale_x_discrete('Task phase',labels = phase_labels)+
+  theme(axis.title = element_text(size = 17),axis.text = element_text(size = 16),legend.position="none")+ scale_fill_brewer(palette="Dark2")
+
+sur5 <-ggplot(pup_sum_type %>% dplyr::filter(session == 1),aes(y=mean_pup, x=factor(phase),fill=factor(type)))+ geom_boxplot()+geom_jitter()+ theme_classic() + labs(y = "Mean pupil size (z-scored)") + theme(axis.title=element_text(face="bold",size=12))+ scale_x_discrete('Task phase',labels = phase_labels)+
+  theme(axis.title = element_text(size = 17),axis.text = element_text(size = 16))+ scale_fill_brewer(palette="Dark2")
+
+
+ggarrange(sur3,sur4, sur5, ncol=2, nrow=2)
+```
+Bin time course
+```{r}
+#bin time
+time_breaks <- seq(0,2,0.2)
+time_labels <- as.character(time_breaks[-1])
+smooth_data <- smooth_data %>%  dplyr::mutate(time_bin = cut(time2, breaks = time_breaks, right = T))
+
+pup_sum_time_bin <- smooth_data %>% dplyr::group_by(subject,session, phase,type, time_bin) %>% dplyr::summarise(mean_pup = mean(pupil_z), max_pup = max(smooth_pup))
+
+time_bin_sum <- summarySEwithin(pup_sum_time_bin %>% filter(!is.na(time_bin)), measurevar = 'mean_pup', withinvars = c("time_bin", 'phase', 'type'),idvar="subject",na.rm = T)
+
+default_alpha <- 0.6
+#accuracy by Phase
+mean_time_bin_gen <- ggplot(data=pup_sum_time_bin, aes(x=as.numeric(time_bin), y=mean_pup, ymin=mean_pup-se, ymax=mean_pup+se, color= phase, fill=phase)) + scale_fill_manual(values= phase_labels, name= "Phase")+scale_color_manual(values= phase_labels, name= 'Phase')+
+  geom_line(size=1) + theme_classic() + geom_ribbon(alpha=default_alpha) + labs(y = "Accuracy",x='Stimulus number') +  #scale_x_continuous( breaks = 1:length(bin_interval_labels),labels = bin_interval_labels) +
+  theme_classic()+theme(axis.title = element_text(size = 20),axis.text = element_text(size = 16))
+
+ggplot(data=time_bin_sum, aes(x=as.numeric(time_bin), y=mean_pup, ymin=mean_pup-se, ymax=mean_pup+se, color= type, fill=type)) + 
+    geom_line(size=1) + geom_ribbon(alpha=default_alpha) + labs(y = "Mean pupil",x='Time (s)') + theme_classic() + theme(axis.title = element_text(size = 20),axis.text = element_text(size = 16)) + facet_wrap(~phase)  + scale_x_continuous( breaks = 1:10, labels = time_labels)+ scale_fill_brewer(palette="Dark2")+scale_color_brewer(palette = 'Dark2')
+```
+
+
+
+
+Baseline correction
+```{r}
+
+```
+
+
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
+
+

@@ -1,0 +1,1746 @@
+---
+title: "Propranolol effects on cognitive effort in tremor-dominant Parkinson's disease"
+author: "Danae Papadopetraki"
+output: html_document
+---
+
+```{r directories, include=FALSE}
+rm(list = ls())
+
+# Repository root: the folder that contains code/ and the (local, non-public) data
+# folders. Defaults to the working directory; override with the PDPHARM_DIR environment
+# variable or by editing this line. See README for the expected data layout.
+projectDir <- Sys.getenv("PDPHARM_DIR", unset = getwd())
+
+
+## Install packages if needed
+packages <- c("tidyverse", "Rmisc", "rmarkdown", 'kableExtra',
+              'readxl', 'ggpubr','webshot', 'DescTools','lme4', 'sjPlot', 'ggrain')
+
+if (length(setdiff(packages, rownames(installed.packages()))) > 0) {
+ install.packages(setdiff(packages, rownames(installed.packages())))  
+}
+
+## Load the packages
+lapply(packages, library, character.only = TRUE)
+
+## Directories
+code_dir <- file.path(projectDir,'code')
+deriv_dir <- file.path(projectDir, 'Data','derivatives')
+analysis_dir <- file.path(projectDir,'Analysis')
+castor_dir <- file.path(projectDir, 'results','beh', 'castor', 'castor_export')
+
+source(file.path(code_dir,'getmode.R'))
+source(file.path(code_dir,'findBetas.R'))
+source(file.path(code_dir,'make_tab.R'))
+
+
+line_val <- '#206daf'
+fill_val <- '#206daf'
+dot_val <- '#206daf'
+font_size <- 13
+alpha_dot <- 0.3
+alpha_line <- 0.6
+```
+
+Load data
+```{r}
+# deblinding list
+drug_list <- read.csv(file.path(deriv_dir,'Deblinding_3024005.02.csv'))
+drug_list <- data.frame(drug_list)
+
+#remove first rows
+drug_list <- drug_list[c(1:28) ,c(1:4)]
+names(drug_list) <- c('script_nr','subNo','drug_ses1','drug_ses2')
+drug_list <- drug_list %>% mutate(drug_ses1 = dplyr::recode(drug_ses1, '1' = 'PBO', '2' = 'PROPRANOLOL'), drug_ses2 = dplyr::recode(drug_ses2, '1' = 'PBO', '2' = 'PROPRANOLOL')) %>% dplyr::mutate(ses_order = case_when(drug_ses1=='PBO' ~ 'PBO first', TRUE~ 'PBO second'))
+
+# add excluded tremor subjects and bind
+subNo <- c(7,13,21,24,26)
+excl_patients <- data.frame(subNo)
+excl_patients$script_nr <- NA
+excl_patients$drug_ses1 <- 'PBO' 
+excl_patients$drug_ses2 <- NA
+excl_patients$ses_order <- 'PBO second'
+
+drug_list <- rbind(drug_list,excl_patients)
+
+#read participant characteristics
+#part_char <- read_delim(file.path(analysis_dir,'Participant Characteristics','input','FullData.csv'), delim = ';')
+part_char <- read_excel(file.path(deriv_dir,'TableFull.xls'))
+part_char$SubNr <- as.numeric(part_char$SubNr)
+part_char <- part_char %>% dplyr::filter(!is.na(SubNr))
+
+# lc_data <- read_excel(file.path(analysis_dir,'MRI','neuromelanine','output','tse_scans','LCIntensities.xlsx'))
+# lc_data$SubNr <- as.numeric(lc_data$SubNr)
+prop <- read.csv(file.path(deriv_dir,'Data_propranolol.csv')) %>%
+  dplyr::select(subNo = Subj_ID, LC_L_prop = LC_int_L, LC_R_prop = LC_int_R)
+
+nor <- read.csv(file.path(deriv_dir, 'nor_data_pupil.csv')) %>%
+  dplyr::select(subNo, LC_L_nor = LC_L.x, LC_R_nor = LC_R.x)
+
+# --- Combine: Data_propranolol is the default, nor_data_pupil fills any gaps ---
+# Named lc_data with SubNr id column to match downstream loops/joins
+lc_data <- dplyr::full_join(prop, nor, by = "subNo") %>%
+  dplyr::mutate(
+    LC_L       = dplyr::coalesce(LC_L_prop, LC_L_nor),
+    LC_R       = dplyr::coalesce(LC_R_prop, LC_R_nor),
+    LC_Average = rowMeans(cbind(LC_L, LC_R), na.rm = TRUE),
+    LC_Average = ifelse(is.nan(LC_Average), NA, LC_Average)
+  ) %>%
+  dplyr::select(SubNr = subNo, LC_L, LC_R, LC_Average) %>%
+  dplyr::arrange(SubNr)
+
+# read trialwise data files
+cw_data <- read.csv(file.path(deriv_dir,'rawDatamat.csv'), header = F)
+choice_data <- read.csv(file.path(deriv_dir,'choices_trialwise.csv'), header = F)
+
+cw_names <- c('subNo', 'sesNo', 'dev','rt', 'setSize', 'type', 'col_pie','lureDif','thetaCorrect','tau','thetaLure' ,'signedDev','trial','block')
+
+choice_names <- c('subNo', 'sesNo', 'type', 'setSize', 'easyOffer', 'hardOffer','choice','choiceRT','counter','adjAmt' ,'typeTask')
+
+names(cw_data) <- cw_names
+names(choice_data) <- choice_names
+
+pupil_data <-  read.csv(file.path(deriv_dir,  'pupil_trialwise.csv'), header = TRUE)
+pupil_ac <-  read.csv(file.path(deriv_dir, 'pupil_full.csv'), header = TRUE)
+
+## ============================================================
+##  OUTLIER PARTICIPANTS -- single switch for the whole script
+##  Set exclude_outliers <- TRUE to drop the flagged participants from ALL
+##  downstream analyses/figures; FALSE keeps everyone. Nothing else to change.
+## ============================================================
+exclude_outliers <- FALSE    # <<< master switch: TRUE drops outlier_ids everywhere
+outlier_k        <- 3       # z cutoff for the statistical deviance rule
+outlier_method   <- 'MAD'   # 'MAD' (robust median/MAD) or 'SD' (classical mean/SD)
+exclude_ip_outliers <- FALSE # FALSE = flag extreme (floor/ceiling) IPs but keep them;
+                             # TRUE = sensitivity analysis dropping them, per task
+
+## Per-subject performance summaries from the raw color-wheel trials.
+## `dev` is the absolute report error in degrees (0 = perfect; ~90 = chance).
+perf_sub <- cw_data %>%
+  dplyr::group_by(subNo) %>%
+  dplyr::summarise(
+    dev_easy = mean(dev[setSize == 1], na.rm = TRUE),  # set size 1 = easiest condition
+    dev_all  = median(dev, na.rm = TRUE),
+    rt_all   = median(rt,  na.rm = TRUE),
+    n_trials = dplyr::n(),
+    .groups  = 'drop')
+
+## z-score for the statistical rule. MAD/median (default) keeps the cutoff robust
+## to the very outliers being detected -- mean/SD get inflated by them (masking),
+## which matters here because absolute deviance is right-skewed and bounded at
+## ~90 deg. Switch to classical SD via `outlier_method <- 'SD'`. Computed on the
+## EASIEST condition (genuine performers cluster tightly there, so a non-performer
+## stands out most), plus overall accuracy and RT.
+zfun <- function(x) {
+  if (outlier_method == 'SD') (x - mean(x, na.rm = TRUE)) / sd(x, na.rm = TRUE)
+  else                        (x - median(x, na.rm = TRUE)) / mad(x, na.rm = TRUE)
+}
+perf_sub <- perf_sub %>%
+  dplyr::mutate(z_dev_easy = zfun(dev_easy), z_dev_all = zfun(dev_all), z_rt = zfun(rt_all))
+
+## Exclusion rules -------------------------------------------------------------
+## (a) Task validity: near-chance accuracy even on the easiest trials. Random
+##     responding on a circular report task gives ~90 deg mean absolute error, so
+##     a participant at/above that on set size 1 was not performing the task.
+chance_out <- perf_sub %>% dplyr::filter(dev_easy >= 90) %>% dplyr::pull(subNo)
+## (b) Statistical deviance outliers: unusually high error (z > k) on easy-trial
+##     accuracy. One-sided -- only worse-than-typical performance is an outlier.
+acc_out <- perf_sub %>% dplyr::filter(z_dev_easy > outlier_k) %>% dplyr::pull(subNo)
+## (c) RT outliers are computed for transparency but DELIBERATELY NOT excluded:
+##     in Parkinson's, tremor/bradykinesia makes slow responses expected, so a
+##     long RT is not a sign of invalid data.
+rt_out  <- perf_sub %>% dplyr::filter(abs(z_rt)   > outlier_k) %>% dplyr::pull(subNo)
+
+## >>> Exclusion set = task-validity (chance) OR statistical deviance outlier.
+##     RT is never used for exclusion (see (c) above).
+outlier_ids <- sort(union(chance_out, acc_out))
+
+cat('Outlier check ------------------------------------------------\n')
+cat('  Method for statistical rule:', outlier_method, '(z cutoff', outlier_k, ')\n')
+cat('  Near-chance accuracy (>=90 deg at set size 1) [EXCLUDED]:', paste(chance_out, collapse = ', '), '\n')
+cat('  Deviance outliers (z_dev_easy >', outlier_k, ') [EXCLUDED]:', paste(acc_out, collapse = ', '), '\n')
+cat('  RT outliers  (|z_rt| >',     outlier_k, ') [diagnostic, NOT excluded -- tremor]:', paste(rt_out, collapse = ', '), '\n')
+cat('  exclude_outliers =', exclude_outliers, '-> excluding ids:',
+    if (length(outlier_ids)) paste(outlier_ids, collapse = ', ') else '(none)', '\n')
+cat('--------------------------------------------------------------\n')
+
+if (exclude_outliers && length(outlier_ids)) {
+  cw_data     <- cw_data     %>% dplyr::filter(!subNo   %in% outlier_ids)
+  choice_data <- choice_data %>% dplyr::filter(!subNo   %in% outlier_ids)
+  pupil_data  <- pupil_data  %>% dplyr::filter(!subject %in% outlier_ids)
+  pupil_ac    <- pupil_ac    %>% dplyr::filter(!subject %in% outlier_ids)
+}
+
+## Subject-level confounds joined into the summary / pupil mixed models further
+## down (age, sex, UPDRS, drug-session order). Trial-level models already carry
+## these via choice_data_char / cw_t_data; these tables cover the models whose
+## summary frames don't. ses_order is subject-constant (PBO first vs second).
+sub_cov <- part_char %>% dplyr::transmute(
+  subNo       = as.numeric(SubNr),
+  Age         = as.numeric(Age),
+  Gender      = factor(Gender),
+  updrs_total = as.numeric(UPDRS_total))
+ses_map <- drug_list %>% dplyr::distinct(subNo, ses_order)
+
+pupil_ac_type <- pupil_ac %>% group_by(subject, drug, setSize) %>% dplyr::summarize (mean_pup =mean (mean_pup), mean_pup_enc = mean(mean_pup_enc), mean_pup_del = mean(mean_pup_del), mean_pup_int = mean(mean_pup_int) )
+
+pupil_ac_sz <- pupil_ac %>% group_by(subject, drug, type) %>% dplyr::summarize (mean_pup =mean (mean_pup), mean_pup_enc = mean(mean_pup_enc), mean_pup_del = mean(mean_pup_del), mean_pup_int = mean(mean_pup_int) )
+
+
+ pupil_drug <- pupil_ac %>% dplyr::group_by (subject,drug) %>% 
+  dplyr::summarise(mean_pup = mean(mean_pup, na.rm = T), 
+                   mean_pup_enc = mean(mean_pup_enc, na.rm = T), mean_pup_int = mean(mean_pup_int, na.rm = T)   )
+
+pupil_wide <- pupil_ac  %>% pivot_wider(id_cols= c(subject), names_from = c(type,setSize,drug), values_from = c(mean_pup,mean_pup_enc,mean_pup_int, mean_pup_del))
+```
+Castor data
+```{r}
+castor_data <- read.delim(file.path(deriv_dir,'export.csv'), sep= ';')
+vas_data <- castor_data %>% dplyr::select(starts_with('VAS'),Participant.Id)
+panas_data <- castor_data %>% dplyr::select(starts_with('PANAS'),Participant.Id)
+
+
+#PANAS
+#remove incomplete data, keep only tremor patients who had 2 sessions
+panas_complete_tr <- panas_data %>% filter(panas_gevoel_aandachtig_1>=0, panas_gevoel_aandachtig_2>=0) 
+
+positive_affect <- c('aandachtig','alert','uitgelaten','geïnteresseerd','enthousiast',"geïnspireerd","trots","vastberaden","sterk","actief")
+
+panas_long <- panas_complete_tr %>% group_by(Participant.Id) %>% pivot_longer(-Participant.Id,names_to = c('domain','sesNo'), values_to = 'score', names_pattern = "panas_gevoel_(.*)_(.*)") %>% dplyr::mutate(affect = case_when(domain %in% positive_affect ~ 'positive', TRUE ~ 'negative'))
+
+#VAS
+alertness <- c('wakker_slaperig','sterk_zwak','suf_helder','goedgecoordineerd_onhandig','sloom_energiek','trag_vlug_vanbegrip','oplettend_dromerig','onbekwaam_bekwaam','belangstellend_verveeld')
+calmness <- c('kalm_opgewonden','gespannen_ontspannen')
+contentedness <- c('tevreden_ontevreden','ongerust_gerust','blij_treurig','vijandig_vriendelijk','teruggetrokken_gezellig')
+vas_complete_tr <- vas_data %>% filter(VAS_blij_treurig_1>=0, VAS_blij_treurig_2>=0) 
+
+vas_long <- vas_complete_tr %>% group_by(Participant.Id) %>% pivot_longer(c(-Participant.Id, -VAS_tremor_response_to_stress), names_to = c('domain','sesNo'), values_to = 'score', names_pattern = "VAS_(.*)_(.*)") %>% dplyr::mutate(factor = case_when(domain %in% alertness ~ 'alertness',domain %in% calmness ~ 'calmness', domain %in% contentedness ~ 'contentedness'))
+
+panas_long$drug <- NA
+vas_long$drug <- NA
+
+panas_long$Participant.Id <- as.numeric(panas_long$Participant.Id)
+vas_long$Participant.Id <- as.numeric(vas_long$Participant.Id)
+
+for (sub in drug_list$subNo){
+  panas_long$drug[panas_long$Participant.Id == sub & panas_long$sesNo==1] <- drug_list$drug_ses1[drug_list$subNo == sub]
+  panas_long$drug[panas_long$Participant.Id == sub & panas_long$sesNo==2] <- drug_list$drug_ses2[drug_list$subNo == sub]
+  panas_long$ses_order[panas_long$Participant.Id == sub] <- drug_list$ses_order[drug_list$subNo == sub]
+  
+  vas_long$drug[vas_long$Participant.Id == sub & vas_long$sesNo==1] <- drug_list$drug_ses1[drug_list$subNo == sub]
+  vas_long$drug[vas_long$Participant.Id == sub & vas_long$sesNo==2] <- drug_list$drug_ses2[drug_list$subNo == sub]
+  vas_long$ses_order[vas_long$Participant.Id == sub] <- drug_list$ses_order[drug_list$subNo == sub]
+}
+
+sum_panas <- panas_long %>% group_by (Participant.Id, affect, drug) %>% dplyr::summarize(sum_score = sum(score))
+
+sum_panas_wide <- sum_panas %>% pivot_wider(id_cols = Participant.Id, names_from = c(affect,drug), values_from = sum_score, names_prefix = 'panas_')
+
+sum_vas <- vas_long %>% group_by (Participant.Id, factor, drug) %>% dplyr::summarize(sum_score = sum(score), mean_score = mean(score, na.rm = T))
+
+sum_vas_wide <- sum_vas %>% pivot_wider(id_cols = Participant.Id, names_from = c(factor,drug), values_from = c(sum_score, mean_score), names_prefix = 'vas_')
+
+
+# # box plot
+# p<-ggplot(sum_panas, aes(x=drug, y=sum_score, fill=drug)) +
+#   geom_boxplot() +geom_jitter() +theme_classic() +labs(y = "PANAS score") + theme(axis.title=element_text(face="bold",size=12))+  theme(axis.title = element_text(size = 17),axis.text = element_text(size = 16),legend.position="none")+ theme_classic()+ facet_wrap(~affect)+ scale_fill_brewer(palette="Dark2")
+# p
+
+pair = rep(1:27, each = 6)
+sum_vas$paired <- pair
+
+v<-ggplot(sum_vas, aes(x=drug, y=mean_score, fill=drug)) +
+  geom_boxplot(outlier.shape = NA) +theme_classic() +labs(y = "VAS score")+ geom_line(aes(group=paired), alpha = 0.5, colour = "grey",position = position_dodge(0.3)) +
+  geom_point(aes(fill=drug, group=paired), alpha=0.6, shape= 21, position = position_dodge(0.3), color='white') + theme(axis.title=element_text(face="bold",size=12))+  theme(axis.title = element_text(size = 17),axis.text = element_text(size = 16),legend.position="none")+ theme_classic()+ facet_wrap(~factor)+ scale_fill_manual(values = c('PBO' = '#1b9e77', 'PROPRANOLOL' = '#d95f02'), name = 'Drug')
+v
+
+# panas with ggplot
+pair = rep(1:27, each = 4)
+sum_panas$paired <- pair
+
+p<-ggplot(sum_panas, aes(x=drug, y=sum_score, fill=drug)) +
+  geom_boxplot(outlier.shape = NA) +theme_classic() +labs(y = "PANAS score")+ geom_line(aes(group=paired), alpha = 0.5, colour = "grey",position = position_dodge(0.3)) +
+  geom_point(aes(fill=drug, group=paired),alpha=0.6, shape= 21, position = position_dodge(0.3), color='white') + theme(axis.title=element_text(face="bold",size=12))+  theme(axis.title = element_text(size = 17),axis.text = element_text(size = 16),legend.position="none")+ theme_classic()+ facet_wrap(~affect)+ scale_fill_manual(values = c('PBO' = '#1b9e77', 'PROPRANOLOL' = '#d95f02'), name = 'Drug')
+p
+# Combine the VAS and PANAS drug-effect plots into one supplemental figure.
+vas_panas_fig <- ggpubr::ggarrange(v, p, nrow = 2, labels = c('A', 'B'), heights = c(1, 1))
+ggsave(file.path(deriv_dir, 'figures', 'vas_panas_drug.pdf'), plot = vas_panas_fig, height = 9, width = 9)
+ggsave(file.path(deriv_dir, 'figures', 'vas_panas_drug.png'), plot = vas_panas_fig, height = 9, width = 9, dpi = 120)
+# # panas by affect
+# p <- ggpaired(sum_vas, x = "drug", y = "mean_score",
+#           color = "drug", fill= 'drug', id='Participant.Id', palette = "Dark2", 
+#           line.color = "gray", line.size = 0.4,
+#           facet.by = "factor")
+# # Use only p.format as label. Remove method name.
+# p + stat_compare_means(label = "p.format", paired = TRUE)
+```
+Did the drug alter mood/affect (VAS / PANAS)?
+```{r vas-panas-stats}
+## Paired t-test PBO vs PROPRANOLOL, run separately for each affect (PANAS) and
+## each factor (VAS) -- one within-subject test per subscale.
+## PANAS uses the summed score per affect; VAS uses the mean score per factor (as plotted).
+
+# drop outliers only when the master switch is on, mirroring the rest of the script
+excl <- if (exclude_outliers) outlier_ids else numeric(0)
+sum_panas_stat <- sum_panas %>% dplyr::filter(!Participant.Id %in% excl)
+sum_vas_stat   <- sum_vas   %>% dplyr::filter(!Participant.Id %in% excl)
+
+# paired t-test on a long frame, grouped by subscale (`grp`)
+paired_drug_test <- function(df, grp, value) {
+  df %>%
+    dplyr::filter(drug %in% c('PBO','PROPRANOLOL')) %>%
+    dplyr::select(dplyr::all_of(c(grp, 'Participant.Id', 'drug', value))) %>%
+    tidyr::pivot_wider(names_from = drug, values_from = dplyr::all_of(value)) %>%
+    dplyr::filter(!is.na(PBO), !is.na(PROPRANOLOL)) %>%
+    dplyr::group_by(dplyr::across(dplyr::all_of(grp))) %>%
+    dplyr::summarise(
+      n         = dplyr::n(),
+      mean_PBO  = mean(PBO),
+      mean_PROP = mean(PROPRANOLOL),
+      mean_diff = mean(PROPRANOLOL - PBO),
+      t         = t.test(PROPRANOLOL, PBO, paired = TRUE)$statistic,
+      df_t      = t.test(PROPRANOLOL, PBO, paired = TRUE)$parameter,
+      p         = t.test(PROPRANOLOL, PBO, paired = TRUE)$p.value,
+      .groups   = 'drop')
+}
+
+cat('\n=== PANAS: PBO vs PROPRANOLOL (paired t-test, summed score by affect) ===\n')
+print(as.data.frame(paired_drug_test(sum_panas_stat, 'affect', 'sum_score')))
+
+cat('\n=== VAS: PBO vs PROPRANOLOL (paired t-test, mean score by factor) ===\n')
+print(as.data.frame(paired_drug_test(sum_vas_stat, 'factor', 'mean_score')))
+
+# Save combined VAS/PANAS drug stats for the supplement.
+vas_panas_stats <- dplyr::bind_rows(
+  paired_drug_test(sum_panas_stat, 'affect', 'sum_score') %>%
+    dplyr::rename(subscale = affect) %>% dplyr::mutate(measure = 'PANAS', score = 'summed'),
+  paired_drug_test(sum_vas_stat, 'factor', 'mean_score') %>%
+    dplyr::rename(subscale = factor) %>% dplyr::mutate(measure = 'VAS', score = 'mean')) %>%
+  dplyr::select(measure, subscale, n, mean_PBO, mean_PROP, mean_diff, t, df_t, p)
+write.csv(vas_panas_stats, file.path(deriv_dir, 'vas_panas_drug_stats.csv'), row.names = FALSE)
+print(as.data.frame(vas_panas_stats))
+```
+Colorwheel performance analysis
+```{r}
+#add group, udprs and LC
+cw_data$tremor_group <- NA
+cw_data$updrs_total <- NA
+
+choice_data$tremor_group <- NA
+choice_data$updrs_total <- NA
+
+for (sub in as.numeric(part_char$SubNr)){
+  cw_data$tremor_group[cw_data$subNo == sub] <- part_char$Tremor_dominant[as.numeric(part_char$SubNr) == sub]
+   cw_data$updrs_total[cw_data$subNo == sub] <- part_char$UPDRS_total[as.numeric(part_char$SubNr) == sub]
+   
+  choice_data$tremor_group[choice_data$subNo == sub] <- part_char$Tremor_dominant[as.numeric(part_char$SubNr) == sub]
+    choice_data$updrs_total[choice_data$subNo == sub] <- part_char$UPDRS_total[as.numeric(part_char$SubNr) == sub]
+}
+
+#add drug
+cw_data$drug <- NA
+choice_data$drug <-NA
+
+for (sub in drug_list$subNo){
+  cw_data$drug[cw_data$subNo == sub & cw_data$sesNo==1] <- drug_list$drug_ses1[drug_list$subNo == sub]
+  cw_data$drug[cw_data$subNo == sub & cw_data$sesNo==2] <- drug_list$drug_ses2[drug_list$subNo == sub]
+  cw_data$ses_order[cw_data$subNo == sub] <- drug_list$ses_order[drug_list$subNo == sub]
+  
+  choice_data$drug[choice_data$subNo == sub & choice_data$sesNo==1] <- drug_list$drug_ses1[drug_list$subNo == sub]
+  choice_data$drug[choice_data$subNo == sub & choice_data$sesNo==2] <- drug_list$drug_ses2[drug_list$subNo == sub]
+  choice_data$ses_order[choice_data$subNo == sub] <- drug_list$ses_order[drug_list$subNo == sub]
+
+}
+
+# add LC data
+cw_data$lc_average <-NA
+cw_data$lc_L <- NA
+cw_data$lc_R <-NA
+
+choice_data$lc_average <-NA
+choice_data$lc_L <- NA
+choice_data$lc_R <-NA
+
+for (sub in as.numeric(lc_data$SubNr)){
+  cw_data$lc_average[cw_data$subNo == sub] <- lc_data$LC_Average[as.numeric(lc_data$SubNr) == sub]
+  cw_data$lc_L[cw_data$subNo == sub] <- lc_data$LC_L[as.numeric(lc_data$SubNr) == sub]
+  cw_data$lc_R[cw_data$subNo == sub] <- lc_data$LC_R[as.numeric(lc_data$SubNr) == sub]
+  
+  choice_data$lc_average[choice_data$subNo == sub] <- lc_data$LC_Average[as.numeric(lc_data$SubNr) == sub]
+  choice_data$lc_L[choice_data$subNo == sub] <- lc_data$LC_L[as.numeric(lc_data$SubNr) == sub]
+  choice_data$lc_R[choice_data$subNo == sub] <- lc_data$LC_R[as.numeric(lc_data$SubNr) == sub]
+  }
+
+#recode type
+cw_data <- cw_data %>% mutate(type = dplyr::recode(type, '0' = 'Ignore', '2' = 'Update'))
+
+#long format summary
+cw_long <- cw_data %>% dplyr::group_by (subNo,drug, setSize, type) %>% dplyr::summarise(mean_dev = mean(dev, na.rm = T), median_dev = median(dev,na.rm = T), mean_rt = mean(rt, na.rm = T), median_rt = median(rt, na.rm = T), mean_lureDif =  mean(lureDif, na.rm = T), median_lureDif = median(lureDif, na.rm = T), tremor_group = getmode(tremor_group), ses_order = getmode(ses_order), sum_resp = sum(!is.na(dev))) %>% mutate (session_nr = case_when(ses_order == 'PBO first' & drug == 'PBO' ~ 1, ses_order == 'PBO second' & drug == 'PROPRANOLOL' ~1, is.na(ses_order) ~ 1, TRUE ~ 2))
+
+cw_long_tr <- cw_long %>% dplyr::filter(tremor_group == 'Yes')
+
+#across type
+```
+
+Table 1. Participant characteristics. Two descriptive columns: (1) the two-session
+sample -- patients who completed the double-blind crossover with usable colour-wheel
+data in BOTH sessions (the drug-analysis sample); (2) the full sample as recruited
+(the two-session patients plus those excluded for an incomplete crossover or missing data).
+```{r table1_td, eval=TRUE, include=TRUE}
+# Two-session set = subjects with two distinct non-missing drug sessions of
+# colour-wheel data (derived from the data, not hard-coded), so the count tracks
+# the analysis sample. Full set = every recruited patient.
+two_ses_ids <- cw_data %>% dplyr::filter(tremor_group == 'Yes', !is.na(drug), !is.na(dev)) %>%
+  dplyr::group_by(subNo) %>% dplyr::summarise(n_ses = dplyr::n_distinct(drug), .groups = 'drop') %>%
+  dplyr::filter(n_ses == 2) %>% dplyr::pull(subNo)
+pc_td   <- part_char %>% dplyr::filter(Tremor_dominant == 'Yes')
+pc_two  <- pc_td %>% dplyr::filter(as.numeric(SubNr) %in% two_ses_ids)
+n_two <- nrow(pc_two); n_full <- nrow(pc_td)
+
+fmt2 <- function(x){ x <- x[!is.na(x)]; sprintf('%.1f ± %.1f', mean(x), sd(x)) }
+row2 <- function(v) c(fmt2(pc_two[[v]]), fmt2(pc_td[[v]]))
+row_gender2 <- c(as.character(sum(pc_two$Gender == 'Female', na.rm = TRUE)),
+                 as.character(sum(pc_td$Gender  == 'Female', na.rm = TRUE)))
+table1_td <- rbind(
+  'Gender, female (n)'        = row_gender2,
+  'Age (years)'               = row2('Age'),
+  'Disease duration (years)'  = row2('Disease_duration'),
+  'MMSE'                      = row2('MMSE_score'),
+  'LEDD (mg)'                 = row2('LEDD'),
+  'MDS-UPDRS III (motor)'     = row2('UPDRS_total'),
+  'MDS-UPDRS tremor subscore' = row2('UPDRS_total_tremor'),
+  'Hoehn & Yahr'              = row2('Hoehn_and_Yahr'))
+table1_td <- data.frame(Characteristic = rownames(table1_td), table1_td,
+                        check.names = FALSE, row.names = NULL)
+colnames(table1_td) <- c('Characteristic',
+                         sprintf('Two-session sample (n = %d)', n_two),
+                         sprintf('Full sample (n = %d)', n_full))
+foot <- paste0("Values are mean ± SD unless otherwise noted. ",
+  "MDS-UPDRS III = Movement Disorder Society Unified Parkinson's Disease Rating Scale, ",
+  "motor examination (Part III); tremor subscore = sum of MDS-UPDRS III tremor items; ",
+  "LEDD = levodopa-equivalent daily dose.")
+
+# save CSV (UTF-8 so the +/- glyph survives)
+con_t1 <- file(file.path(deriv_dir, 'table1_participant_characteristics.csv'), encoding = 'UTF-8')
+write.csv(table1_td, con_t1, row.names = FALSE)
+
+kt1 <- kable(table1_td, format = 'html', align = c('l', 'c', 'c'),
+             caption = 'Table 1. Participant characteristics') %>%
+  kable_classic(full_width = FALSE, html_font = 'Cambria', font_size = 16) %>%
+  kableExtra::column_spec(1, width = '5cm') %>%
+  kableExtra::footnote(general = foot, general_title = "Note. ", footnote_as_chunk = TRUE)
+# render PNG (guarded: a webshot/phantomjs failure must not abort the knit)
+tryCatch({
+  tmp1 <- tempfile(fileext = '.html')
+  # left-align the caption/title so it matches the other (sjPlot) tables, and add a
+  # horizontal rule directly under the title (separating it from the table body)
+  full1 <- paste0('<!DOCTYPE html><html><head><meta charset="utf-8">',
+                  '<style>caption{text-align:left !important;padding-left:0;',
+                  'border-bottom:1.5px solid #000;padding-bottom:5px;margin-bottom:2px;}',
+                  'tfoot td{border-top:1.5px solid #000 !important;padding-top:5px;}</style></head><body>',
+                  as.character(kt1), '</body></html>')
+  c1 <- file(tmp1, encoding = 'UTF-8'); writeLines(full1, c1, useBytes = FALSE); close(c1)
+  webshot::webshot(paste0('file:///', gsub('\\\\', '/', normalizePath(tmp1))),
+                   file.path(deriv_dir, 'figures', 'table1_participant_characteristics.png'),
+                   zoom = 2, selector = 'table')
+  unlink(tmp1)
+}, error = function(err) cat('Table 1 PNG render skipped:', conditionMessage(err), '\n'))
+kt1
+```
+
+```{r table1_td_spacer, include=FALSE}
+#across type
+cw_sz <- cw_data %>% dplyr::group_by (subNo,drug,setSize) %>% dplyr::summarise(mean_dev = mean(dev, na.rm = T), median_dev = median(dev,na.rm = T), mean_rt = mean(rt, na.rm = T), median_rt = median(rt, na.rm = T), mean_lureDif =  mean(lureDif, na.rm = T), median_lureDif = median(lureDif, na.rm = T))
+
+#across set size
+cw_type <- cw_data %>% dplyr::group_by (subNo,drug,type) %>% dplyr::summarise(mean_dev = mean(dev, na.rm = T), median_dev = median(dev,na.rm = T), mean_rt = mean(rt, na.rm = T), median_rt = median(rt, na.rm = T), mean_lureDif =  mean(lureDif, na.rm = T), median_lureDif = median(lureDif, na.rm = T), tremor_group = getmode(tremor_group), ses_order = getmode(ses_order)) %>% mutate (session_nr = case_when(ses_order == 'PBO first' & drug == 'PBO' ~ 1, ses_order == 'PBO second' & drug == 'PROPRANOLOL' ~1, is.na(ses_order) ~ 1, TRUE ~ 2))
+
+#across everything
+cw_drug <- cw_data %>% filter(tremor_group=='Yes') %>% dplyr::group_by (subNo,drug) %>% dplyr::summarise(mean_dev = mean(dev, na.rm = T), median_dev = median(dev,na.rm = T), mean_rt = mean(rt, na.rm = T), median_rt = median(rt, na.rm = T), mean_lureDif =  mean(lureDif, na.rm = T), median_lureDif = median(lureDif, na.rm = T), )
+
+#wide format summary
+cw_wide_non_tremor <- cw_long %>% dplyr::filter(tremor_group == 'No') %>% pivot_wider(id_cols= c(subNo, tremor_group), names_from = c(type,setSize), values_from = c(mean_dev,median_dev,mean_rt, median_rt, mean_lureDif, median_lureDif,sum_resp))
+
+cw_wide_tremor <- cw_long %>% dplyr::filter(tremor_group == 'Yes', !is.na(drug)) %>% pivot_wider(id_cols= c(subNo,tremor_group, ses_order), names_from = c(type,setSize,drug), values_from = c(mean_dev,median_dev,mean_rt, median_rt, mean_lureDif, median_lureDif))
+
+#wide by type
+cw_wide_tremor_type <- cw_type %>% dplyr::filter(tremor_group == 'Yes', !is.na(drug)) %>% pivot_wider(id_cols= c(subNo,tremor_group, ses_order), names_from = c(type,drug), values_from = c(mean_dev,median_dev,mean_rt, median_rt, mean_lureDif, median_lureDif)) %>% mutate(median_dev_cond_effect = (median_dev_Ignore_PBO - median_dev_Update_PBO)- (median_dev_Ignore_PROPRANOLOL-median_dev_Update_PROPRANOLOL), mean_dev_cond_effect = (mean_dev_Ignore_PBO - mean_dev_Update_PBO)- (mean_dev_Ignore_PROPRANOLOL-mean_dev_Update_PROPRANOLOL), median_rt_cond_effect = (median_rt_Ignore_PBO - median_rt_Update_PBO)- (median_rt_Ignore_PROPRANOLOL-median_rt_Update_PROPRANOLOL), mean_rt_cond_effect = (mean_rt_Ignore_PBO - mean_rt_Update_PBO)- (mean_rt_Ignore_PROPRANOLOL-mean_rt_Update_PROPRANOLOL), median_dev_ignore_effect = median_dev_Ignore_PBO-median_dev_Ignore_PROPRANOLOL, mean_dev_ignore_effect = mean_dev_Ignore_PBO-mean_dev_Ignore_PROPRANOLOL, median_rt_ignore_effect = median_rt_Ignore_PBO-median_rt_Ignore_PROPRANOLOL, mean_rt_ignore_effect = mean_rt_Ignore_PBO-mean_rt_Ignore_PROPRANOLOL, median_dev_Update_effect = median_dev_Update_PBO-median_dev_Update_PROPRANOLOL, mean_dev_Update_effect = mean_dev_Update_PBO-mean_dev_Update_PROPRANOLOL, median_rt_Update_effect = median_rt_Update_PBO-median_rt_Update_PROPRANOLOL, mean_rt_Update_effect = mean_rt_Update_PBO-mean_rt_Update_PROPRANOLOL)
+
+#wide by drug
+cw_wide_drug <- cw_drug %>% dplyr::filter(!is.na(drug)) %>% pivot_wider(id_cols= c(subNo), names_from = c(drug), values_from = c(mean_dev,median_dev,mean_rt, median_rt, mean_lureDif, median_lureDif)) %>% mutate(median_dev_effect  = median_dev_PBO - median_dev_PROPRANOLOL, mean_dev_effect = mean_dev_PBO - mean_dev_PROPRANOLOL,  median_rt_effect = median_rt_PBO-median_rt_PROPRANOLOL, mean_rt_effect = mean_rt_PBO-mean_rt_PROPRANOLOL )
+
+#write.csv(cw_wide_ses1,file.path(deriv_dir, 'cw_wide_session1.csv'), row.names = FALSE)
+write.csv(cw_data,file.path(deriv_dir, 'raw_cw_data_drug.csv'), row.names = FALSE)
+
+```
+Choices analysis
+```{r}
+## type task: (1:8, 1:i1-i3, 2: u1-u3, 3: i1-u1, 4: i3-u3, 5: i1-nr, 6: i3-nr, 6: u1-nr 8: u3-nr)
+
+choice_data <- choice_data %>% mutate(type = dplyr::recode(type, '0' = 'Ignore', '2' = 'Update')) %>% dplyr::filter(!is.na(choice)) %>%  dplyr::mutate(task_name = case_when(typeTask <= 2 ~ 'sz', typeTask == 3 | typeTask == 4 ~ 'dir', typeTask >= 5 ~ 'nr' ), session_nr = case_when(ses_order == 'PBO first' & drug == 'PBO' ~ 1, ses_order == 'PBO second' & drug == 'PROPRANOLOL' ~1, is.na(ses_order) ~ 1, TRUE ~ 2))
+
+ip_long <- choice_data %>% dplyr::group_by (subNo,drug,task_name,type,setSize) %>% dplyr::filter (counter == max(`counter`)) %>% dplyr::summarise(IP = case_when(choice == 1 ~ easyOffer- adjAmt/2, choice == 0 ~ easyOffer+ adjAmt/2), tremor_group = getmode(tremor_group), ses_order = getmode(ses_order),session_nr = getmode(sesNo))
+
+## ---- IP extreme-value flag (per task) ----
+## An IP at the floor/ceiling of the offer range can mean EITHER a non-converged
+## staircase OR a genuine extreme preference (always avoid / always take effort) --
+## the two are indistinguishable from the IP alone, and a real extreme preference
+## may be the effect of interest. So extreme IPs are FLAGGED for transparency but
+## KEPT in the primary analysis. Flip exclude_ip_outliers to TRUE only to run a
+## sensitivity analysis. The flag is per (subNo, task_name), applied task-specific
+## (a participant's extreme IP on one task does not remove their other tasks).
+ip_lo <- 0.25; ip_hi <- 3.75   # offer range is ~0.09-3.9; these catch the rails
+ip_flag <- ip_long %>% dplyr::group_by(subNo, task_name) %>%
+  dplyr::summarise(mean_IP = mean(IP, na.rm = TRUE), .groups = 'drop') %>%
+  dplyr::mutate(ip_extreme = mean_IP <= ip_lo | mean_IP >= ip_hi)
+cat('IP extreme-value flags per task (kept unless exclude_ip_outliers = TRUE):\n')
+print(as.data.frame(dplyr::filter(ip_flag, ip_extreme)))
+ip_excl <- ip_flag %>% dplyr::filter(ip_extreme) %>% dplyr::select(subNo, task_name)
+if (exclude_ip_outliers && nrow(ip_excl) > 0) {
+  ip_long <- ip_long %>% dplyr::anti_join(ip_excl, by = c('subNo', 'task_name'))
+}
+
+ip_long_nr <- ip_long %>% dplyr::filter(task_name == 'nr' & !is.na(drug))
+  
+ratio_long_nr <- choice_data %>% filter(task_name =='nr') %>% dplyr::group_by (subNo,drug,type,setSize) %>% dplyr::summarise(ratio_redo = sum(choice)/5 )
+
+ratio_long_nr_type_drug <- choice_data %>% filter(task_name =='nr') %>% dplyr::group_by (subNo,drug,type) %>% dplyr::summarise(ratio_redo = sum(choice)/10 )
+
+auc_nr <- ip_long_nr %>% dplyr::summarise(auc_nr = DescTools::AUC(as.numeric(setSize), IP)) 
+
+ip_wide_nr <- ip_long_nr %>% pivot_wider(id_cols= subNo, names_from = c(type, setSize,drug), values_from = IP)
+
+ip_wide_dir <- ip_long %>% dplyr::filter(task_name == 'dir' & !is.na(drug)) %>% pivot_wider(id_cols= subNo, names_from = c(setSize,drug), values_from = IP, names_prefix='sz') %>% dplyr::mutate(sz1_effect = sz1_PROPRANOLOL - sz1_PBO, sz3_effect = sz3_PROPRANOLOL - sz3_PBO, sz_effect = sz3_effect - sz1_effect )
+
+ip_wide_sz <- ip_long %>% dplyr::filter(task_name == 'sz' & !is.na(drug)) %>% pivot_wider(id_cols= subNo, names_from = c(type,drug), values_from = IP)
+
+ip_wide_tremor <- ip_long %>% dplyr::filter(!is.na(drug)) %>% group_by (task_name) %>% pivot_wider(id_cols= c(subNo,tremor_group, ses_order), names_from = c(task_name, type, setSize, drug), values_from = IP)
+
+ip_wide <- inner_join(ip_wide_nr,ip_wide_dir, by='subNo') %>% inner_join(., ip_wide_sz, by = 'subNo')
+
+write.csv(choice_data,file.path(deriv_dir, 'raw_choice_data_drug.csv'), row.names = FALSE)
+
+```
+Merge data frames
+```{r}
+
+nor_data <- left_join(cw_wide_tremor,ip_wide, by = 'subNo') %>% left_join(., part_char, by = c( 'subNo' = 'SubNr')) %>% left_join(., lc_data, by = c('subNo'= 'SubNr')) %>% left_join(., cw_wide_tremor_type %>% dplyr::select(-tremor_group,-ses_order), by = 'subNo') %>% left_join(., cw_wide_drug , by = 'subNo') %>% left_join(., sum_panas_wide , by = c('subNo' = 'Participant.Id'))
+
+  
+#write.csv(nor_data,file.path(deriv_dir, 'data_wide.csv'), row.names = FALSE)
+
+#write.csv(data_PBO,file.path(deriv_dir, 'data_pbo_only.csv'), row.names = FALSE)
+
+```
+
+```{r}
+x_var <- 'LC_L'
+x_lab <- "LC intactness (left)"
+data_to_plot <- nor_data # %>% filter(median_dev_effect<40)
+d1<- ggscatter(data_to_plot, x = x_var,y = 'sz1_effect', color = dot_val,alpha = alpha_dot, fill = "light grey",
+                   shape = 19, size = 2,
+                   add = "reg.line", conf.int = TRUE,  add.params = list(color = dot_val,
+                                                                        fill = fill_val,alpha = alpha_line),
+               cor.coef = TRUE, cor.coeff.args = list(method = "pearson", label.y.npc = 'bottom'),
+               ylab = "Drug effect \n on Ignore vs Update IPs (sz1)", xlab = x_lab) + 
+  font("xlab", size= 14) + font("ylab", size= 14)
+d1
+d3 <- ggscatter(data_to_plot , x = x_var,y = 'sz3_effect', color = dot_val,alpha = alpha_dot, fill = "light grey",
+                   shape = 19, size = 2,
+                   add = "reg.line", conf.int = TRUE,  add.params = list(color = dot_val,
+                                                                        fill = fill_val,alpha = alpha_line),
+               cor.coef = TRUE, cor.coeff.args = list(method = "pearson", label.y.npc = 'top'),
+               ylab = "Drug effect \n on Ignore vs Update IPs (sz3)", xlab = x_lab) + 
+  font("xlab", size= 14) + font("ylab", size= 14)
+d3
+dsz <- ggscatter(data_to_plot, x = x_var,y = 'sz_effect', color = dot_val,alpha = alpha_dot, fill = "light grey",
+                   shape = 19, size = 2,
+                   add = "reg.line", conf.int = TRUE,  add.params = list(color = dot_val,
+                                                                        fill = fill_val,alpha = alpha_line),
+               cor.coef = TRUE, cor.coeff.args = list(method = "pearson", label.y.npc = 'top'),
+               ylab = "Drug effect \n on Ignore vs Update IPs (sz3 - sz1)", xlab = x_lab) + 
+  font("xlab", size= 14) + font("ylab", size= 14)
+dsz
+ggarrange(d1,d3,dsz, ncol=3)
+```
+
+Mixed model: predict deviance drug effects
+```{r}
+
+cw_data_char <- inner_join(cw_data,part_char, by = c( 'subNo' = 'SubNr')) %>% left_join(., pupil_data, by = c('subNo' = 'subject', 'sesNo' = 'session','trial' ))
+  
+  #stops installation questions
+options(buildtools.check = function(action) TRUE)
+cw_t_data <- cw_data_char %>% dplyr::filter(tremor_group=='Yes') %>% dplyr::mutate(
+  updrs_total_z = ave(updrs_total, FUN = scale), 
+  age_z = ave(Age, FUN = scale),
+  lc_average_z = ave(lc_average, FUN = scale), 
+  mean_pup_int_z =  ave(mean_pup_int, FUN = scale),
+  mean_pup_z = ave(mean_pup, FUN = scale),
+  mean_pup_enc_z = ave(mean_pup_enc, FUN = scale))
+
+## Complete-session restriction for DRUG models: keep only subjects with BOTH drug
+## conditions (the within-subject crossover). Applied via only_cs() at each drug
+## model's data = argument. Drug-INDEPENDENT analyses (ribbons, PBO descriptives,
+## group comparisons) keep the full frames. All drug models use (1+drug_dev|subNo).
+only_cs <- function(df) df %>% dplyr::group_by(subNo) %>%
+  dplyr::filter(dplyr::n_distinct(drug[!is.na(drug)]) == 2) %>% dplyr::ungroup()
+
+## Deviation (sum-to-zero, ±0.5) coding of the design factors. Using these in the
+## models makes every lower-order coefficient a MARGINAL main effect (averaged over
+## the other factors) rather than a simple effect at an arbitrary reference / at
+## setSize = 0 -- so the make_tab coefficient tables report the correct main-effect
+## p-values directly. This is a reparameterisation: model fit, predictions and all
+## interaction tests are identical; only the coefficient rows become interpretable.
+## Direction of each contrast (high level = +0.5): effort_dev = high vs low load;
+## type_dev = Update vs Ignore; drug_dev = propranolol vs placebo; task_dev =
+## no-effort-vs-effort vs low-vs-high-effort. Original factor columns are kept for
+## figures and for the emmeans simple-effects (drug within Ignore/Update).
+add_dev <- function(df) {
+  df$drug_dev   <- ifelse(as.character(df$drug) == 'PROPRANOLOL', 0.5, -0.5)
+  if ('type' %in% names(df))        df$type_dev   <- ifelse(as.character(df$type) == 'Update', 0.5, -0.5)
+  if ('setSize' %in% names(df))     df$effort_dev <- ifelse(df$setSize == 3, 0.5, -0.5)
+  if ('effort_task' %in% names(df)) df$task_dev   <- ifelse(as.character(df$effort_task) == 'No-effort vs effort', 0.5, -0.5)
+  df
+}
+
+ devL <- lmer(dev ~ effort_dev*type_dev*drug_dev+ updrs_total_z +ses_order+Gender + age_z + mean_pup_int_z+(1+drug_dev|subNo),data = add_dev(only_cs(cw_t_data)), control = lmerControl(optimizer = 'Nelder_Mead', optCtrl = list(maxfun = 100000000)))
+  
+  prefix='deviance_drug_lmer'
+
+ save("devL", file = file.path(deriv_dir, sprintf("%s.RData",'deviance_drug_lmer')))
+
+  dv_labels <- 'Performance error'
+
+
+#findBetas(devTrMl)
+```
+Mixed model: predict rt drug effects 
+```{r}
+
+  #stops installation questions
+options(buildtools.check = function(action) TRUE)
+# 
+rtLni <- lmer(rt ~ effort_dev*type_dev*drug_dev + updrs_total_z +ses_order+Gender + age_z + mean_pup_int_z+(1+drug_dev|subNo),data = add_dev(only_cs(cw_t_data)), control = lmerControl(optimizer = 'Nelder_Mead', optCtrl = list(maxfun = 100000000)))
+ 
+
+ # Combined performance table: deviance (devL) and reaction time (rtLni) side by
+ # side. rtLni matches devL's structure (effort_dev*type_dev*drug_dev + additive covariates)
+ # so the rows align across the two columns.
+ make_tab(model = list(devL, rtLni),
+          title = 'Table 2. Performance drug effects',
+          dv_labels = c('Performance error', 'Reaction time'),
+          directory = deriv_dir)
+
+```
+
+Mixed model: predict choice no redo tremor, drug effects
+```{r echo=TRUE}
+
+choice_data_char <- inner_join(choice_data,part_char, by = c( 'subNo' = 'SubNr')) 
+
+
+  #stops installation questions
+options(buildtools.check = function(action) TRUE)
+
+nr_tr_choice_data <-choice_data_char %>% dplyr::filter(tremor_group=='Yes', typeTask>=5) %>% dplyr::inner_join(., pupil_ac, by = c('subNo' = 'subject', 'drug',  'type', 'setSize'))%>% dplyr::left_join(., cw_long %>% dplyr::select(subNo, drug, median_dev, type, setSize), by = c('subNo','drug', 'type','setSize'))
+
+choiceLp <- glmer(choice ~ drug_dev+scale(mean_pup, scale = T)+effort_dev+type_dev+scale(median_dev, scale=T)+scale(updrs_total, scale = T)+scale(easyOffer, scale = T)+scale(Age,scale = T)+Gender+ses_order+(1+drug_dev|subNo),data = add_dev(only_cs(nr_tr_choice_data)), family = binomial,  control = glmerControl(optimizer = 'Nelder_Mead', optCtrl = list(maxfun = 1000000000000000)))
+
+ summary(choiceLp)
+    prefix='choice_tremor'
+  save("choiceLp", file = file.path(deriv_dir, sprintf("%s.RData",prefix)))
+  
+# Match the performance models' structure: the no-redo (nr) task varies both
+# setSize and type, so include the full effort_dev*type_dev*drug_dev interaction.
+# Random effects: maximal supported by the data (the full 3-way random slope is
+# singular); (1+drug_dev|subNo) is the richest that converges non-singular.
+# WM-task deviance (performance error) as a per-cell covariate, matched to the
+# factors this model includes (setSize x type x drug): median WM deviance in cell.
+nr_tr_choice_data <- nr_tr_choice_data %>% dplyr::left_join(
+  cw_t_data %>% dplyr::group_by(subNo, setSize, type, drug) %>%
+    dplyr::summarise(wm_dev = median(dev, na.rm = TRUE), .groups = 'drop'),
+  by = c('subNo', 'setSize', 'type', 'drug'))
+# median_dev dropped (was only in this model); covariates harmonized across all
+# choice models so Age/UPDRS/easy offer collapse to single rows in the combined table.
+choiceLNp <- glmer(choice ~ effort_dev*type_dev*drug_dev + scale(easyOffer)+scale(updrs_total)+scale(Age)+Gender+ses_order+scale(wm_dev) + (1+drug_dev|subNo),data = add_dev(only_cs(nr_tr_choice_data)), family = binomial,  control = glmerControl(optimizer = 'bobyqa', optCtrl = list(maxfun = 2e5)))
+      
+#table
+
+```
+
+Pupil during working memory predicts subsequent high-effort choice (tremor-dominant)
+```{r pupil_predicts_choice_TD, message=FALSE, warning=FALSE}
+## Does pupil DURING the WM task predict subsequently CHOOSING the higher-effort option?
+## TREMOR-DOMINANT, PBO session only (one observation per subject -- the placebo/baseline
+## session, so the pupil-choice relationship is characterised without the drug manipulation;
+## including the propranolol session attenuates it). Three decision types, reported together in
+## one table for consistency with the other analyses: no-redo (nr, effort vs no effort),
+## set-size (sz, low vs high effort), and the two pooled (merged). Outcome chose_high_effort =
+## as.integer(choice == 0). Pupil is z-scored WITHIN SESSION (pupil_cells_wz.csv) and joined at
+## each design's granularity (nr: setSize x type; sz/merged: type). INTERACTION spec: pupil
+## interacts with the deviation-coded (±0.5) design factors, so the scale(pupil) main term is the
+## MARGINAL pupil effect (the table's Pupil row = the reported number). Task-type is dropped from
+## the encoding/delay models (the two task-types are physically identical until interference).
+pupphases_pc <- c('wz_whole', 'wz_enc', 'wz_del', 'wz_int')
+cells_wz_pc  <- read.csv(file.path(deriv_dir, 'pupil_cells_wz.csv'))
+pc_cov_pc <- part_char %>% dplyr::transmute(subNo = as.numeric(SubNr),
+  updrs_tot = as.numeric(UPDRS_total), Age = as.numeric(Age), Gender = Gender)
+# pupil aggregated to each design's granularity
+pup_nr_g <- cells_wz_pc %>% dplyr::group_by(subject, session, setSize, type) %>%
+  dplyr::summarise(dplyr::across(dplyr::all_of(pupphases_pc), ~mean(.x, na.rm = TRUE)), .groups = 'drop')
+pup_ty_g <- cells_wz_pc %>% dplyr::group_by(subject, session, type) %>%
+  dplyr::summarise(dplyr::across(dplyr::all_of(pupphases_pc), ~mean(.x, na.rm = TRUE)), .groups = 'drop')
+# base = TD, PBO session, with covariates and the high-effort outcome
+base_pc_td <- choice_data %>%
+  dplyr::filter(tremor_group == 'Yes', drug == 'PBO', !is.na(choice)) %>%
+  dplyr::mutate(chose_high_effort = as.integer(choice == 0)) %>%
+  dplyr::left_join(pc_cov_pc, by = 'subNo')
+add_dev_pc <- function(df){
+  if ('setSize' %in% names(df))     df$effort_dev <- ifelse(df$setSize == 3, 0.5, -0.5)
+  if ('type' %in% names(df))        df$type_dev   <- ifelse(as.character(df$type) == 'Update', 0.5, -0.5)
+  if ('effort_task' %in% names(df)) df$task_dev   <- ifelse(as.character(df$effort_task) == 'sz', 0.5, -0.5)
+  df }
+nr_pc_td <- add_dev_pc(base_pc_td %>% dplyr::filter(task_name == 'nr') %>%
+  dplyr::left_join(pup_nr_g, by = c('subNo'='subject','sesNo'='session','setSize','type')))
+sz_pc_td <- add_dev_pc(base_pc_td %>% dplyr::filter(task_name == 'sz') %>%
+  dplyr::left_join(pup_ty_g, by = c('subNo'='subject','sesNo'='session','type')))
+mg_pc_td <- add_dev_pc(base_pc_td %>% dplyr::filter(task_name %in% c('nr','sz')) %>%
+  dplyr::mutate(effort_task = task_name) %>%
+  dplyr::left_join(pup_ty_g, by = c('subNo'='subject','sesNo'='session','type')))
+
+gctrl_pc <- glmerControl(optimizer = 'bobyqa', optCtrl = list(maxfun = 2e5))
+specs_pc <- list('Effort vs no effort' = list(df = nr_pc_td, design = 'effort_dev*type_dev'),
+                 'High vs low effort'  = list(df = sz_pc_td, design = 'type_dev'),
+                 'Merged'              = list(df = mg_pc_td, design = 'task_dev*type_dev'))
+# type only meaningful once interference stimuli appear -> stripped from encoding/delay
+strip_type_pc <- function(d){ p <- trimws(strsplit(d, '\\*')[[1]]); p <- p[p != 'type_dev']
+  if (length(p) == 0) '1' else paste(p, collapse = '*') }
+design_for_pc <- function(design, pv) if (pv %in% c('wz_enc','wz_del')) strip_type_pc(design) else design
+fit_pc <- function(df, design, pv){
+  d <- df %>% dplyr::mutate(pupil = .data[[pv]])
+  interact <- if (design == '1') 'scale(pupil)' else paste0('scale(pupil)*', design)
+  f <- paste0('chose_high_effort ~ ', interact,
+              ' + scale(easyOffer) + scale(updrs_tot) + scale(Age) + Gender + (1|subNo)')
+  glmer(as.formula(f), data = d, family = binomial, control = gctrl_pc)
+}
+
+# --- MAIN TABLE: whole-trial pupil, one column per decision type (nr / sz / merged) ---
+main_TD_pc <- lapply(specs_pc, function(s) fit_pc(s$df, s$design, 'wz_whole'))
+save(main_TD_pc, file = file.path(deriv_dir, 'pupil_choice_main_TD.RData'))
+cat('\n=== Pupil -> high-effort choice (tremor-dominant, PBO): whole-trial marginal pupil ===\n')
+for (nm in names(specs_pc)) { d <- specs_pc[[nm]]$df %>% dplyr::filter(!is.na(wz_whole))
+  co <- summary(main_TD_pc[[nm]])$coefficients; r <- 'scale(pupil)'
+  cat(sprintf('  %-20s subj=%d decisions=%d  OR=%.3f [%.3f, %.3f]  z=%.2f  p=%.4g\n', nm,
+      dplyr::n_distinct(d$subNo), nrow(d),
+      exp(co[r,1]), exp(co[r,1]-1.96*co[r,2]), exp(co[r,1]+1.96*co[r,2]),
+      co[r,3], 2*pnorm(-abs(co[r,3])))) }
+wins_pc <- c(Encoding = 'wz_enc', Delay = 'wz_del', Interference = 'wz_int', 'Whole trial' = 'wz_whole')
+
+# --- MAIN Table 5: no-redo (effort vs no effort) pupil -> choice, by working-memory phase.
+# The headline of this exploratory analysis is that WM pupil predicts subsequent effort
+# choice; the no-redo decisions carry it, so the MAIN table shows the no-redo effect resolved
+# across phases (Encoding, Delay, Interference, Whole trial). Task-type is dropped from the
+# encoding/delay models (the two task-types are physically identical until interference). ---
+nr_by_win <- lapply(names(wins_pc), function(w) fit_pc(nr_pc_td, design_for_pc('effort_dev*type_dev', wins_pc[[w]]), wins_pc[[w]]))
+make_tab(model = nr_by_win, directory = deriv_dir,
+         title = 'Table 5. Pupil predicts high-effort choice (no-redo) by working-memory phase',
+         dv_labels = names(wins_pc))
+
+# --- SUPPLEMENT (cross-task comparison, so the reader can see the effect is not shown for
+# the other decisions because it is undetectable there, NOT because it was omitted): the three
+# decision types (no-redo / set-size / merged) compared at the WHOLE-TRIAL ('average') pupil
+# and at the DELAY window (where even the pooled effect was reliable). main_TD_pc = whole-trial. ---
+make_tab(model = unname(main_TD_pc), directory = deriv_dir,
+         title = 'Supplemental Table 4. Pupil predicts high-effort choice by decision type (whole-trial pupil)',
+         dv_labels = names(specs_pc))
+delay_by_task <- lapply(names(specs_pc), function(nm) fit_pc(specs_pc[[nm]]$df, design_for_pc(specs_pc[[nm]]$design, 'wz_del'), 'wz_del'))
+make_tab(model = delay_by_task, directory = deriv_dir,
+         title = 'Supplemental Table 5. Pupil predicts high-effort choice by decision type (delay-window pupil)',
+         dv_labels = names(specs_pc))
+
+# --- internal record: marginal pupil OR by decision type x window (all cells, for the text) ---
+pc_phase_td <- do.call(rbind, lapply(names(specs_pc), function(nm){
+  do.call(rbind, lapply(names(wins_pc), function(w){ pv <- wins_pc[[w]]
+    m  <- fit_pc(specs_pc[[nm]]$df, design_for_pc(specs_pc[[nm]]$design, pv), pv)
+    co <- summary(m)$coefficients; r <- 'scale(pupil)'
+    data.frame(decision = nm, window = w, OR = round(exp(co[r,1]), 3),
+               CI = sprintf('[%.2f, %.2f]', exp(co[r,1]-1.96*co[r,2]), exp(co[r,1]+1.96*co[r,2])),
+               z = round(co[r,3], 2), p = round(2*pnorm(-abs(co[r,3])), 4),
+               row.names = NULL) })) }))
+cat('\n=== Pupil -> high-effort choice (tremor-dominant, PBO): by decision type x window ===\n')
+print(pc_phase_td)
+write.csv(pc_phase_td, file.path(deriv_dir, 'pupil_choice_TD_phase_summary.csv'), row.names = FALSE)
+
+# --- Figure 3D: model-predicted P(chose the higher-effort option) across the within-session
+# pupil range (no-redo decisions). Predictors are pre-scaled; design factors held at their
+# deviation-coded centre (marginal effect), covariates at their mean,
+# Gender at reference; population-level (fixed-effects) fit with a delta-method 95% CI; the
+# x-axis is back-transformed to the within-session z pupil scale. ---
+predict_pc_td <- function(df, design){
+  d <- df %>% dplyr::filter(is.finite(wz_whole)) %>%
+    dplyr::mutate(pupz = as.numeric(scale(wz_whole)),
+                  eoz = as.numeric(scale(easyOffer)), untz = as.numeric(scale(updrs_tot)),
+                  agez = as.numeric(scale(Age)), Gender = factor(Gender))
+  mu <- mean(d$wz_whole, na.rm = TRUE); sdv <- sd(d$wz_whole, na.rm = TRUE)
+  interact <- if (design == '1') 'pupz' else paste0('pupz*', design)
+  m <- glmer(as.formula(paste0('chose_high_effort ~ ', interact, ' + eoz + untz + agez + Gender + (1|subNo)')),
+             data = d, family = binomial, control = gctrl_pc)
+  dvterms <- setdiff(trimws(unlist(strsplit(design, '[*]'))), '1')
+  g0 <- list(pupz = seq(quantile(d$pupz, .02, na.rm = TRUE), quantile(d$pupz, .98, na.rm = TRUE), length = 80),
+             eoz = 0, untz = 0, agez = 0, Gender = factor(levels(d$Gender)[1], levels = levels(d$Gender)))
+  for (tt in dvterms) g0[[tt]] <- 0
+  grid <- do.call(expand.grid, g0)
+  eta <- as.numeric(predict(m, newdata = grid, re.form = NA, type = 'link'))
+  X <- model.matrix(delete.response(terms(lme4::nobars(formula(m)))), grid)
+  beta <- lme4::fixef(m); V <- as.matrix(vcov(m))
+  keep <- intersect(names(beta), colnames(X)); X <- X[, keep, drop = FALSE]; V <- V[keep, keep, drop = FALSE]
+  se <- sqrt(rowSums((X %*% V) * X))
+  grid %>% dplyr::mutate(pupil = pupz * sdv + mu, fit = plogis(eta),
+                         lo = plogis(eta - 1.96 * se), hi = plogis(eta + 1.96 * se))
+}
+# primary: no-redo (effort-vs-no-effort), the significant effect
+pred_nr_td <- predict_pc_td(nr_pc_td, 'effort_dev*type_dev')
+fig5_td <- ggplot(pred_nr_td, aes(pupil, fit)) +
+  geom_ribbon(aes(ymin = lo, ymax = hi), alpha = .18, fill = '#126192') +
+  geom_line(colour = '#126192', linewidth = 1.1) + theme_classic() +
+  labs(x = 'Pupil during working memory (within-session z)',
+       y = 'Predicted P(chose higher-effort option)') +
+  theme(axis.title = element_text(size = 13))
+print(fig5_td)
+ggsave(file.path(deriv_dir, 'figures', 'pupil_choice_predicted_TD.pdf'), plot = fig5_td, height = 4.2, width = 6)
+ggsave(file.path(deriv_dir, 'figures', 'pupil_choice_predicted_TD.png'), plot = fig5_td, height = 4.2, width = 6, dpi = 120)
+```
+
+
+Drug effect on pupil (z-scored and raw)
+```{r}
+# ---- Drug effect on pupil ---------------------------------------------------
+# Finalised with a pipeline consistent with the WM performance models: fit on the
+# SAME trial-level frame (cw_t_data = tremor patients, both drug sessions), the
+# SAME effort_dev*type_dev*drug_dev fixed structure, the SAME additive covariates, and the
+# SAME maximal-supported (1+drug_dev|subNo) random-effects protocol as devL/rtL
+# (reduce to (1|subNo) only when the maximal model is singular). Pupil is the DV
+# here, so mean_pup_int is NOT entered as a covariate. Fit for every phase
+# (whole-trial, encoding, delay, interference), both z-scored (within session)
+# and raw; z and raw are kept in two separate tables.
+
+fit_pupil <- function(dv) {
+  base <- paste0(dv, " ~ effort_dev*type_dev*drug_dev + updrs_total_z + ses_order + Gender + age_z + ")
+  ctrl <- lmerControl(optimizer = 'Nelder_Mead', optCtrl = list(maxfun = 1e8))
+  m <- lmer(as.formula(paste0(base, "(1+drug_dev|subNo)")), data = add_dev(only_cs(cw_t_data)), control = ctrl)
+  if (isSingular(m))  # parsimonious reduction, same rule as the other drug models
+    m <- lmer(as.formula(paste0(base, "(1|subNo)")), data = add_dev(only_cs(cw_t_data)), control = ctrl)
+  m
+}
+
+# z-scored (within-session) pupil, per phase
+pupil_z_whole <- fit_pupil('mean_pup')
+pupil_z_enc   <- fit_pupil('mean_pup_enc')
+pupil_z_del   <- fit_pupil('mean_pup_del')
+pupil_z_int   <- fit_pupil('mean_pup_int')
+
+# raw pupil, per phase
+pupil_raw_whole <- fit_pupil('mean_raw_pup')
+pupil_raw_enc   <- fit_pupil('mean_raw_pup_enc')
+pupil_raw_del   <- fit_pupil('mean_raw_pup_del')
+pupil_raw_int   <- fit_pupil('mean_raw_pup_int')
+
+save(pupil_z_whole, pupil_z_enc, pupil_z_del, pupil_z_int,
+     pupil_raw_whole, pupil_raw_enc, pupil_raw_del, pupil_raw_int,
+     file = file.path(deriv_dir, 'pupil_drug.RData'))
+
+# One table (z-scored, within-session): mean (whole trial) + the three task phases side
+# by side. The raw-scaling table was dropped -- z-scored (size-normalised) is the primary
+# and only reported pupil metric; the raw fits are still computed above for the record.
+make_tab(model = list(pupil_z_whole, pupil_z_enc, pupil_z_del, pupil_z_int),
+         title = 'Table 4. Pupil drug effects', directory = deriv_dir,
+         dv_labels = c('Mean', 'Encoding', 'Delay', 'Interference'))
+
+# --- raw per-session pupil frame (used by the pupil figures below). Map session -> drug.
+both_drug <- pupil_ac %>% dplyr::filter(!is.na(drug)) %>% dplyr::distinct(subject, drug) %>%
+  dplyr::count(subject) %>% dplyr::filter(n == 2) %>% dplyr::pull(subject)
+
+drug_long <- drug_list %>% dplyr::select(subNo, drug_ses1, drug_ses2) %>%
+  tidyr::pivot_longer(c(drug_ses1, drug_ses2), names_to = 'session', values_to = 'drug',
+                      names_pattern = 'drug_ses(.)') %>%
+  dplyr::mutate(session = as.integer(session))
+
+pup_raw_ses <- read.csv(file.path(deriv_dir, 'pupil_full_ses.csv')) %>%
+  dplyr::left_join(drug_long, by = c('subject' = 'subNo', 'session')) %>%
+  dplyr::filter(!is.na(drug), subject %in% both_drug) %>%
+  dplyr::left_join(sub_cov, by = c('subject' = 'subNo')) %>%
+  dplyr::left_join(ses_map, by = c('subject' = 'subNo'))
+```
+
+Ignore vs update choice tremor
+```{r}
+
+  #stops installation questions
+options(buildtools.check = function(action) TRUE)
+
+dir_tr_choice_data <-choice_data_char %>% dplyr::filter(tremor_group=='Yes', typeTask %in% c(3,4))%>% inner_join(., pupil_ac_type, by = c('subNo' = 'subject', 'setSize', 'drug' )) 
+
+dir_tr_choice_data <- dir_tr_choice_data %>% dplyr::mutate(easyOfferZ = (easyOffer - mean(easyOffer))/sd(easyOffer))
+
+#no pupil. drug is within-subject -> random slope (1+drug_dev|subNo)
+# Match the performance models where applicable: the ignore-vs-update (dir) task
+# chooses BETWEEN task types, so type cannot be a predictor; include effort_dev*drug_dev.
+## Random effects: maximal structure the data support (Barr 2013; reduced per
+## Matuschek 2017/Bates 2015 when singular). Full (1+effort_dev*drug_dev|subNo) is
+## singular, so we drop the interaction slope -> (1+drug_dev|subNo) (converges,
+## non-singular). setSize:drug is null and stable across structures.
+## WM-task deviance per cell matched to this model's factors (setSize x drug).
+dir_tr_choice_data <- dir_tr_choice_data %>% dplyr::left_join(
+  cw_t_data %>% dplyr::group_by(subNo, setSize, drug) %>%
+    dplyr::summarise(wm_dev = median(dev, na.rm = TRUE), .groups = 'drop'),
+  by = c('subNo', 'setSize', 'drug'))
+np <- glmer(choice ~ effort_dev*drug_dev + scale(easyOffer)+scale(updrs_total)+scale(Age)+Gender+ses_order+scale(wm_dev) + (1+drug_dev|subNo),data = add_dev(only_cs(dir_tr_choice_data)), family = binomial,  control = glmerControl(optimizer = 'bobyqa',optCtrl = list(maxfun = 2e5) ))
+ # choiceDirTrM <- brm(choice ~ scale(easyOffer)+drug+setSize+ses_order+scale(Age)+(1+drug_dev|subNo),data = add_dev(only_cs(dir_tr_choice_data)),  family = 'bernoulli', cores = getOption("mc.cores", 8), warmup = 1000, iter = 2000, chains = 6,control = list(adapt_delta = 0.99))
+ #  summary(choiceDirTrM)
+
+#with pupil. drug is within-subject -> random slope (1+drug_dev|subNo)
+ wp <- glmer(choice ~scale(easyOffer, scale = T)+setSize+ses_order+scale(Age,scale = T)+Gender+drug+scale(updrs_total, scale = T)+scale(mean_pup, scale = T)+(1+drug_dev|subNo),data = add_dev(only_cs(dir_tr_choice_data)), family = binomial,  control = glmerControl(optimizer = 'bobyqa',optCtrl = list(maxfun = 2e5) ))
+ 
+ # choice_dir_TrLm <- glmer(choice ~scale(easyOffer)+drug+setSize+ses_order+scale(Age)+(1|subNo),data = add_dev(only_cs(dir_tr_choice_data)), family = binomial,  control = glmerControl(optimizer = 'Nelder_Mead',optCtrl = list(maxfun = 100000000000) ))
+  prefix='choice_direct_tremor'
+
+  save("wp", file = file.path(deriv_dir, sprintf("%s.RData",prefix)))
+
+```
+Low vs high effort choice tremor
+```{r}
+
+  #stops installation questions
+options(buildtools.check = function(action) TRUE)
+
+sz_tr_choice_data <-choice_data_char %>% dplyr::filter(tremor_group=='Yes', typeTask <=2)
+
+sz_tr_choice_data <- sz_tr_choice_data %>% dplyr::mutate(easyOfferZ = (easyOffer - mean(easyOffer))/sd(easyOffer))
+
+ # choiceSZTrM <- brm(choice~scale(easyOffer)+drug_dev*type_dev+scale(Age)+ses_order+(1+drug_dev|subNo),data = add_dev(only_cs(sz_tr_choice_data)),  family = 'bernoulli', cores = getOption("mc.cores", 8), warmup = 1000, iter = 2000, chains = 6,control = list(adapt_delta = 0.99))
+ #  summary(choiceSZTrM)
+  
+# Random effects: maximal structure supported by the data. drug_dev*type_dev is the tested
+# within-subject interaction, so include its random slope: (1+drug_dev|subNo)
+# converges non-singular. NB this is more conservative than (1+drug_dev|subNo): it
+# moves the drug x type interaction from p=.008 (anti-conservative) to a trend
+# (p=.14); the drug simple effect at Ignore stays significant (OR 0.33, p=.035).
+## WM-task deviance (performance error) per cell matched to this model's factors
+## (type x drug; setSize is the choice dimension here so it cannot enter). Controls
+## for WM performance -- the covariate is deviance (which the drug affects), not RT
+## (which it does not) -- so the effort effect is not explained by WM performance.
+sz_tr_choice_data <- sz_tr_choice_data %>% dplyr::left_join(
+  cw_t_data %>% dplyr::group_by(subNo, type, drug) %>%
+    dplyr::summarise(wm_dev = median(dev, na.rm = TRUE), .groups = 'drop'),
+  by = c('subNo', 'type', 'drug'))
+choice_sz_TrLm <- glmer(choice ~ drug_dev*type_dev + scale(easyOffer)+scale(updrs_total)+scale(Age)+Gender+ses_order+scale(wm_dev) + (1+drug_dev|subNo),data = add_dev(only_cs(sz_tr_choice_data)), family = binomial,  control = glmerControl(optimizer = 'bobyqa', optCtrl = list(maxfun = 2e5)))
+
+tab_model(choice_sz_TrLm)
+
+
+# --- Verify the drug x task-type interaction with a model-free, subject-level test ---
+# Aggregate each subject's P(choose the higher set size) per drug x type, then test the
+# drug effect (PROPRANOLOL - PBO) within each task-type with a paired t-test. This
+# confirms the glmer interaction without relying on its link function or optimizer.
+# (choice==1 = chose the LOW set size, so chose_high = choice==0.)
+sz_high <- sz_tr_choice_data %>%
+  dplyr::mutate(chose_high = as.integer(choice == 0)) %>%
+  dplyr::group_by(subNo, drug, type) %>%
+  dplyr::summarise(p_high = mean(chose_high), .groups = 'drop')
+cat('\n=== sz: mean P(choose high set size) by drug x task-type ===\n')
+print(as.data.frame(sz_high %>% dplyr::group_by(drug, type) %>%
+                      dplyr::summarise(p_high = mean(p_high), .groups = 'drop')))
+sz_wide <- sz_high %>% tidyr::pivot_wider(names_from = drug, values_from = p_high)
+cat('\n=== sz: drug effect (PROPRANOLOL - PBO) within each task-type (paired t-test) ===\n')
+for (ty in sort(unique(as.character(sz_wide$type)))) {
+  d <- dplyr::filter(sz_wide, type == ty)
+  d <- d[stats::complete.cases(d[, c('PBO', 'PROPRANOLOL')]), ]
+  tt <- t.test(d$PROPRANOLOL, d$PBO, paired = TRUE)
+  cat(sprintf('  %-7s: diff = %+.3f, t(%d) = %.2f, p = %.3f (n = %d)\n',
+              ty, mean(d$PROPRANOLOL - d$PBO),
+              tt$parameter, tt$statistic, tt$p.value, nrow(d)))
+}
+
+  prefix='choice_sz_tremor'
+
+  save("choice_sz_TrLm", file = file.path(deriv_dir, sprintf("%s.RData",prefix)))
+
+
+# =====================================================================================
+# Direct-comparison validation of the nr task-type effect (TD patients, placebo only)
+# -------------------------------------------------------------------------------------
+# In the no-redo (nr) task there is a task-type effect: TD patients redo the WM task
+# (choice==0 = chose to exert effort) MORE for Update than for Ignore trials. A
+# model-free validation is to look at the DIRECT (dir) comparison, where Ignore and
+# Update are pitted against each other in the same trial. Task design: the a-priori
+# higher-effort offer was always FIXED at 2 (in dir that offer is Ignore; the Update
+# offer was titrated), so choice==0 = chose Ignore and choice==1 = chose Update. We make
+# no claim about which option is subjectively more effortful for these patients — the
+# labels below are the task's Ignore/Update conditions only.
+# Because dir is a staircase, the raw choice proportion is compressed toward 0.5, so we
+# report BOTH P(chose Ignore) and the indifference point (IP) of the titrated Update
+# offer relative to the fixed Ignore offer (2): IP < 2 means Update was chosen even when
+# it paid less than Ignore, i.e. Update was preferred.
+cat('\n===== Direct-comparison validation of the nr task-type effect (TD, PBO) =====\n')
+
+# (1) nr: P(chose to exert effort / redo) by task-type, paired Ignore vs Update
+nr_eff_pbo <- choice_data_char %>%
+  dplyr::filter(tremor_group == 'Yes', typeTask >= 5, drug == 'PBO', !is.na(choice)) %>%
+  dplyr::mutate(chose_effort = as.integer(choice == 0)) %>%
+  dplyr::group_by(subNo, type) %>%
+  dplyr::summarise(p_eff = mean(chose_effort), .groups = 'drop')
+cat('\n[nr] mean P(chose to redo / exert effort) by task-type:\n')
+print(as.data.frame(nr_eff_pbo %>% dplyr::group_by(type) %>%
+                      dplyr::summarise(p_eff = mean(p_eff), .groups = 'drop')))
+nr_eff_wide <- nr_eff_pbo %>% tidyr::pivot_wider(names_from = type, values_from = p_eff)
+nr_eff_wide <- nr_eff_wide[stats::complete.cases(nr_eff_wide[, c('Ignore', 'Update')]), ]
+tt_nr <- t.test(nr_eff_wide$Ignore, nr_eff_wide$Update, paired = TRUE)
+cat(sprintf('[nr] Ignore - Update = %+.3f, t(%d) = %.2f, p = %.3f (n = %d)\n',
+            mean(nr_eff_wide$Ignore - nr_eff_wide$Update),
+            tt_nr$parameter, tt_nr$statistic, tt_nr$p.value, nrow(nr_eff_wide)))
+
+# (2) dir: P(chose Ignore over Update), one-sample vs 0.5
+dir_ign_pbo <- choice_data_char %>%
+  dplyr::filter(tremor_group == 'Yes', typeTask %in% c(3, 4), drug == 'PBO', !is.na(choice)) %>%
+  dplyr::mutate(chose_ignore = as.integer(choice == 0)) %>%
+  dplyr::group_by(subNo) %>%
+  dplyr::summarise(p_ignore = mean(chose_ignore), .groups = 'drop')
+tt_dir <- t.test(dir_ign_pbo$p_ignore, mu = 0.5)
+cat(sprintf('\n[dir] P(chose Ignore over Update) = %.3f vs 0.5, t(%d) = %.2f, p = %.3f (n = %d)\n',
+            mean(dir_ign_pbo$p_ignore), tt_dir$parameter, tt_dir$statistic,
+            tt_dir$p.value, nrow(dir_ign_pbo)))
+
+# (3) dir: indifference point of the titrated Update offer vs the fixed Ignore offer (2)
+dir_ip_pbo <- ip_long %>%
+  dplyr::filter(task_name == 'dir', tremor_group == 'Yes', drug == 'PBO') %>%
+  dplyr::group_by(subNo) %>%
+  dplyr::summarise(IP = mean(IP, na.rm = TRUE), .groups = 'drop')
+tt_ip <- t.test(dir_ip_pbo$IP, mu = 2)
+cat(sprintf('[dir] Update-vs-Ignore IP = %.3f vs 2 (fixed Ignore offer), t(%d) = %.2f, p = %.3f (n = %d)\n',
+            mean(dir_ip_pbo$IP, na.rm = TRUE), tt_ip$parameter, tt_ip$statistic,
+            tt_ip$p.value, nrow(dir_ip_pbo)))
+cat('  (IP < 2 => Update chosen even when it paid less than Ignore, i.e. Update preferred)\n')
+
+# Save the validation numbers
+dir_valid <- data.frame(
+  measure = c('nr P(effort) Ignore', 'nr P(effort) Update', 'nr Ignore-Update paired t',
+              'dir P(chose Ignore)', 'dir P(Ignore) vs .5 t', 'dir Update-vs-Ignore IP',
+              'dir IP vs 2 t'),
+  estimate = c(mean(dplyr::filter(nr_eff_pbo, type == 'Ignore')$p_eff),
+               mean(dplyr::filter(nr_eff_pbo, type == 'Update')$p_eff),
+               mean(nr_eff_wide$Ignore - nr_eff_wide$Update),
+               mean(dir_ign_pbo$p_ignore),
+               mean(dir_ign_pbo$p_ignore) - 0.5,
+               mean(dir_ip_pbo$IP, na.rm = TRUE),
+               mean(dir_ip_pbo$IP, na.rm = TRUE) - 2),
+  statistic = c(NA, NA, tt_nr$statistic, NA, tt_dir$statistic, NA, tt_ip$statistic),
+  df = c(NA, NA, tt_nr$parameter, NA, tt_dir$parameter, NA, tt_ip$parameter),
+  p = c(NA, NA, tt_nr$p.value, NA, tt_dir$p.value, NA, tt_ip$p.value))
+write.csv(dir_valid, file.path(deriv_dir, 'dir_type_validation.csv'), row.names = FALSE)
+
+```
+Pooled effort analysis: low/no-effort vs high-effort choices (tremor)
+```{r}
+# Propranolol affects the low-vs-high effort (sz) choices but not the
+# effort-vs-no-effort (nr) choices. Pool both into a single "chose the higher-effort
+# option" outcome to test (a) whether propranolol has an overall effect on effort
+# choice, and (b) whether that effect differs between the two choice types.
+# choice==1 = chose the lower-effort option in BOTH tasks (no-redo in nr, sz1 in sz),
+# so chose_high_effort = (choice == 0) is consistent across them.
+options(buildtools.check = function(action) TRUE)
+
+effort_choice_data <- choice_data_char %>%
+  dplyr::filter(tremor_group == 'Yes', task_name %in% c('nr','sz')) %>%
+  dplyr::mutate(
+    effort_task       = factor(dplyr::recode(task_name, nr = 'No-effort vs effort',
+                                             sz = 'Low vs high effort'),
+                               levels = c('Low vs high effort', 'No-effort vs effort')),
+    chose_high_effort = as.integer(choice == 0),
+    easyOffer_z       = as.numeric(scale(easyOffer)))
+# WM-task deviance per cell matched to the pooled model's factors (type x drug).
+effort_choice_data <- effort_choice_data %>% dplyr::left_join(
+  cw_t_data %>% dplyr::group_by(subNo, type, drug) %>%
+    dplyr::summarise(wm_dev = median(dev, na.rm = TRUE), .groups = 'drop'),
+  by = c('subNo', 'type', 'drug'))
+
+# Drug is a within-subject manipulation, so include a random slope for drug
+# (1+drug_dev|subNo); a random-intercept-only model underestimates the drug SE.
+# (a) interaction model, mirroring the single-task choice models: full
+# drug_dev*task_dev*type_dev. This both pools the two choice tasks and carries the
+# drug x task-type interaction, so it independently verifies the sz finding.
+# (Converges, not singular. drug x type p=.010; the 3-way drug x effort_task x type
+# is n.s. (p=.16), i.e. the drug x task-type pattern does not differ between tasks.)
+## Random effects: maximal supported = (1+drug_dev|subNo) (converges non-singular;
+## the fuller drug_dev*task_dev*type_dev random slope is singular). Pooling nr+sz doubles
+## the data, so even with this conservative random structure the drug x task-type
+## interaction is significant here (OR 2.55, p=.024) -- unlike the sz-only model,
+## where it is only a trend. drug x effort_task (nr vs sz) remains null (p=.30).
+effort_drug_int <- glmer(chose_high_effort ~ drug_dev*task_dev*type_dev + scale(easyOffer)+scale(updrs_total)+scale(Age)+Gender+ses_order+scale(wm_dev) + (1+drug_dev|subNo),
+                         data = add_dev(only_cs(effort_choice_data)), family = binomial,
+                         control = glmerControl(optimizer = 'bobyqa',
+                                                optCtrl = list(maxfun = 2e5)))
+summary(effort_drug_int)
+
+# (b) additive model: pooled propranolol effect on choosing the higher-effort option
+effort_drug <- glmer(chose_high_effort ~ drug_dev + task_dev + type_dev + scale(easyOffer)+scale(updrs_total)+scale(Age)+Gender+ses_order+scale(wm_dev) + (1+drug_dev|subNo),
+                     data = add_dev(only_cs(effort_choice_data)), family = binomial,
+                     control = glmerControl(optimizer = 'bobyqa',
+                                            optCtrl = list(maxfun = 2e5)))
+summary(effort_drug)
+
+prefix <- 'effort_pooled_tremor'
+save(effort_drug_int, effort_drug, file = file.path(deriv_dir, sprintf('%s.RData', prefix)))
+
+# Merged model for the COMBINED choice table, fit on `choice` (==1 = lower-effort
+# option) rather than chose_high_effort, so its odds ratios share the polarity of
+# the single-task columns (choiceLNp/np/choice_sz_TrLm). Same maximal-supported RE
+# as effort_drug_int. This is the exploratory merged-task column.
+merged_tab <- glmer(choice ~ drug_dev*task_dev*type_dev + scale(easyOffer)+scale(updrs_total)+scale(Age)+Gender+ses_order+scale(wm_dev) + (1+drug_dev|subNo),
+                    data = add_dev(only_cs(effort_choice_data)), family = binomial,
+                    control = glmerControl(optimizer = 'bobyqa', optCtrl = list(maxfun = 2e5)))
+
+# Combined choice table: the three single-task decisions plus the exploratory merged
+# sz+nr model, side by side. Predictor sets differ, so tab_model unions the terms and
+# blanks cells where a predictor is absent. All binomial glmers -> odds ratios; all
+# columns model `choice` (==1 = lower-effort / reference option), so ORs are comparable.
+make_tab(model = list(choice_sz_TrLm, choiceLNp, np, merged_tab),
+         title = 'Table 3. Drug effects on motivation',
+         dv_labels = c('High vs low effort', 'Effort vs no effort', 'Ignore vs update', 'High vs no/low effort'),
+         directory = deriv_dir)
+```
+Propranolol simple effects on effort choice, within each task-type
+```{r drug-simple-effects, message=FALSE, warning=FALSE}
+## The deviation-coded coefficient tables above give the marginal drug effect and the
+## drug x task-type interaction directly. The one thing they cannot show is the
+## condition-specific SIMPLE effect (propranolol within Ignore vs within Update) --
+## the headline. We recover it with emmeans on the sz and pooled models. The models'
+## outcome is `choice` (==1 = LOWER-effort option), so the odds ratio for choosing the
+## HIGHER-effort option is exp(-contrast).
+library(emmeans)
+simple_or <- function(m, lab){
+  em <- emmeans(m, ~ drug_dev | type_dev,
+                at = list(drug_dev = c(-0.5, 0.5), type_dev = c(-0.5, 0.5)))
+  s  <- as.data.frame(summary(pairs(em, reverse = TRUE), infer = c(TRUE, TRUE)))
+  data.frame(Model = lab,
+             `Task-type` = ifelse(s$type_dev == 0.5, 'Update', 'Ignore'),
+             `OR higher-effort` = round(exp(-s$estimate), 2),
+             `CI low`  = round(exp(-s$asymp.UCL), 2),
+             `CI high` = round(exp(-s$asymp.LCL), 2),
+             p = round(s$p.value, 3), check.names = FALSE)
+}
+drug_simple_effects <- rbind(simple_or(choice_sz_TrLm, 'High-vs-low effort'),
+                             simple_or(merged_tab,     'Pooled effort'))
+knitr::kable(drug_simple_effects, row.names = FALSE,
+             caption = 'Propranolol simple effects (OR for choosing the higher-effort option), by task-type.')
+```
+Bayesian (brms) confirmation of the drug effects -- Supplementary Table
+```{r brms-confirmation, message=FALSE, warning=FALSE}
+## Bayesian confirmation of the drug effects. Guarded by run_brms because brms compiles
+## and samples (~15 min; needs Rtools). run_brms = TRUE refits the deviation-coded models
+## on the complete-session sample and caches posterior summaries to brms_supp.rds;
+## FALSE loads the cache and renders the table. The reported contrasts (marginal drug,
+## drug x task-type, propranolol-in-Ignore) are coding-invariant, so the cache is valid.
+run_brms   <- FALSE
+brms_cache <- file.path(deriv_dir, 'brms_supp.rds')
+if (run_brms) {
+  suppressMessages({library(brms); library(emmeans)}); options(mc.cores = 4)
+  bfit <- function(f, dat, fam) brm(bf(as.formula(f)), data = dat, family = fam,
+            chains = 4, iter = 2000, warmup = 1000,
+            control = list(adapt_delta = if (identical(fam, gaussian())) .95 else .99),
+            seed = 1, refresh = 0, silent = 2)
+  cwB <- add_dev(only_cs(cw_t_data)); szB <- add_dev(only_cs(sz_tr_choice_data)); ecB <- add_dev(only_cs(effort_choice_data))
+  szB$chose_high_effort <- as.integer(szB$choice == 0)
+  covB <- 'scale(easyOffer)+scale(updrs_total)+scale(Age)+Gender+ses_order+scale(wm_dev)'
+  bdev <- bfit('dev ~ effort_dev*type_dev*drug_dev + updrs_total_z+ses_order+Gender+age_z+mean_pup_int_z + (1+drug_dev|subNo)', cwB, gaussian())
+  brt  <- bfit('rt  ~ effort_dev*type_dev*drug_dev + updrs_total_z+ses_order+Gender+age_z+mean_pup_int_z + (1+drug_dev|subNo)', cwB, gaussian())
+  bpup <- bfit('mean_pup ~ effort_dev*type_dev*drug_dev + updrs_total_z+ses_order+Gender+age_z + (1+drug_dev|subNo)', cwB, gaussian())
+  bsz  <- bfit(paste0('chose_high_effort ~ drug_dev*type_dev + ', covB, ' + (1+drug_dev|subNo)'), szB, bernoulli())
+  bec  <- bfit(paste0('chose_high_effort ~ drug_dev*task_dev*type_dev + ', covB, ' + (1+drug_dev|subNo)'), ecB, bernoulli())
+  pdf_ <- function(x){m<-mean(x>0);max(m,1-m)}
+  G <- function(ct){s<-as.data.frame(ct);dr<-as.matrix(emmeans::as.mcmc.emmGrid(ct))[,1];setNames(c(s$estimate[1],quantile(dr,.025),quantile(dr,.975),pdf_(dr)),c('est','lo','hi','pd'))}
+  dm  <- function(m) G(pairs(emmeans(m,~drug_dev,at=list(drug_dev=c(-.5,.5))),reverse=TRUE))
+  di  <- function(m) G(contrast(emmeans(m,~drug_dev*type_dev,at=list(drug_dev=c(-.5,.5),type_dev=c(-.5,.5))),interaction=c('revpairwise','revpairwise')))
+  ig  <- function(m){e<-emmeans(m,~drug_dev|type_dev,at=list(drug_dev=c(-.5,.5),type_dev=c(-.5,.5)));ii<-pairs(e,reverse=TRUE);S<-as.matrix(emmeans::as.mcmc.emmGrid(ii));s<-as.data.frame(ii);k<-which(s$type_dev==-.5);setNames(c(s$estimate[k],quantile(S[,k],.025),quantile(S[,k],.975),pdf_(S[,k])),c('est','lo','hi','pd'))}
+  brms_supp <- list(dev=dm(bdev), rt=dm(brt), rt_int=di(brt), pup=dm(bpup),
+                    sz_int=di(bsz), sz_ign=ig(bsz), ec_int=di(bec), ec_ign=ig(bec))
+  saveRDS(brms_supp, brms_cache)
+  ## Full, human-readable dump of EVERY fixed-effect posterior (main effects,
+  ## interactions and covariates) for every drug model, so any brms result is
+  ## accessible without refitting even if it is not cited in the paper.
+  full_fixef <- function(fit, label){
+    dr <- as.data.frame(fit); cols <- grep('^b_', names(dr), value = TRUE)
+    logit <- fit$family$family %in% c('bernoulli','binomial')
+    do.call(rbind, lapply(cols, function(pn){ x <- dr[[pn]]
+      data.frame(model = label, term = sub('^b_','',pn),
+                 median = median(x), est_error = sd(x),
+                 lo = unname(quantile(x,.025)), hi = unname(quantile(x,.975)),
+                 pd = max(mean(x>0), mean(x<0)),
+                 OR_median = if (logit) exp(median(x)) else NA_real_,
+                 OR_lo = if (logit) exp(unname(quantile(x,.025))) else NA_real_,
+                 OR_hi = if (logit) exp(unname(quantile(x,.975))) else NA_real_,
+                 row.names = NULL) })) }
+  brms_all_drug <- rbind(
+    full_fixef(bdev,'perf_error'), full_fixef(brt,'reaction_time'),
+    full_fixef(bpup,'pupil'), full_fixef(bsz,'choice_sz'), full_fixef(bec,'choice_pooled'))
+  write.csv(brms_all_drug, file.path(deriv_dir, 'brms_all_fixef_drug.csv'), row.names = FALSE)
+  saveRDS(list(dev=bdev, rt=brt, pup=bpup, sz=bsz, ec=bec),
+          file.path(deriv_dir, 'brms_drug_fits.rds'))
+}
+if (file.exists(brms_cache)) {
+  bs <- readRDS(brms_cache)
+  lin <- function(x,d=2) sprintf('%.*f [%.*f, %.*f]', d, x['est'], d, x[2], d, x[3])
+  orr <- function(x)     sprintf('%.2f [%.2f, %.2f]', exp(x['est']), exp(x[2]), exp(x[3]))
+  pdv <- function(x)     sprintf('%.3f', x['pd'])
+  brms_tab <- data.frame(
+    Effect = c('Performance error: propranolol (°)','Reaction time: propranolol (s)',
+               'Reaction time: propranolol × task-type (s)','Pupil dilation: propranolol (Z)',
+               'Effort choice, sz: propranolol × task-type (OR)','Effort choice, sz: propranolol in Ignore (OR)',
+               'Effort choice, pooled: propranolol × task-type (OR)','Effort choice, pooled: propranolol in Ignore (OR)'),
+    `Posterior [95% CrI]` = c(lin(bs$dev), lin(bs$rt,3), lin(bs$rt_int,3), lin(bs$pup),
+                              orr(bs$sz_int), orr(bs$sz_ign), orr(bs$ec_int), orr(bs$ec_ign)),
+    pd = c(pdv(bs$dev),pdv(bs$rt),pdv(bs$rt_int),pdv(bs$pup),pdv(bs$sz_int),pdv(bs$sz_ign),pdv(bs$ec_int),pdv(bs$ec_ign)),
+    check.names = FALSE)
+  knitr::kable(brms_tab, row.names = FALSE,
+               caption = 'Supplemental Table 1. Bayesian (brms) confirmation: posterior median, 95% credible interval, probability of direction (pd).')
+} else message('brms cache not found -- set run_brms <- TRUE to fit and cache.')
+
+# Figure: proportion choosing the higher-effort option, by drug and choice type
+effort_sum <- effort_choice_data %>% dplyr::group_by(subNo, drug, effort_task) %>%
+  dplyr::summarise(p_high = mean(chose_high_effort, na.rm = TRUE), .groups = 'drop')
+effort_sum_se <- summarySEwithin(effort_sum, measurevar = 'p_high',
+                                 withinvars = c('drug','effort_task'), idvar = 'subNo')
+ggplot(effort_sum_se, aes(x = drug, y = p_high, fill = drug)) +
+  geom_col(width = 0.6) +
+  geom_errorbar(aes(ymin = p_high - se, ymax = p_high + se), width = 0.15) +
+  facet_wrap(~effort_task) + theme_classic() +
+  labs(y = 'P(chose higher-effort option)', x = 'Drug') +
+  scale_x_discrete(labels = drug_labels) +
+  scale_fill_brewer(palette = 'Set1') +
+  theme(legend.position = 'none', axis.title = element_text(size = 15),
+        axis.text = element_text(size = 13))
+ggsave(file.path(deriv_dir, 'figures', 'effort_pooled_drug.pdf'), height = 5, width = 8)
+```
+Paired t-tests: propranolol vs placebo (subject-level)
+```{r}
+# Simplest test of the drug effect: one value per patient per
+# drug, paired PBO vs propranolol (tremor patients with both sessions). These
+# corroborate the subject-level mixed models; report them alongside.
+paired_t <- function(df, value, label) {
+  w <- df %>% dplyr::ungroup() %>% dplyr::select(subNo, drug, val = {{ value }}) %>%
+    tidyr::pivot_wider(names_from = drug, values_from = val) %>%
+    dplyr::filter(!is.na(PBO), !is.na(PROPRANOLOL))
+  tt <- t.test(w$PROPRANOLOL, w$PBO, paired = TRUE)
+  data.frame(measure = label, N = nrow(w),
+             PBO = round(mean(w$PBO), 3), PROPRANOLOL = round(mean(w$PROPRANOLOL), 3),
+             diff = round(unname(tt$estimate), 3),
+             CI_low = round(tt$conf.int[1], 3), CI_high = round(tt$conf.int[2], 3),
+             t = round(unname(tt$statistic), 2), df = unname(tt$parameter),
+             p = round(tt$p.value, 3), row.names = NULL)
+}
+
+# per-subject x drug summaries (tremor patients, averaged over conditions)
+dev_rt_sub <- cw_long %>% dplyr::ungroup() %>% dplyr::filter(tremor_group == 'Yes', !is.na(drug)) %>%
+  dplyr::group_by(subNo, drug) %>%
+  dplyr::summarise(dev = mean(median_dev, na.rm = TRUE), rt = mean(median_rt, na.rm = TRUE), .groups = 'drop')
+ip_sub     <- ip_long_nr %>% dplyr::ungroup() %>% dplyr::filter(!is.na(drug)) %>%
+  dplyr::group_by(subNo, drug) %>% dplyr::summarise(IP = mean(IP, na.rm = TRUE), .groups = 'drop')
+# sz task = set size 1 vs 3 (effort discounting); dir task = ignore vs update
+ip_sz_sub  <- ip_long %>% dplyr::ungroup() %>% dplyr::filter(task_name == 'sz', !is.na(drug)) %>%
+  dplyr::group_by(subNo, drug) %>% dplyr::summarise(IP = mean(IP, na.rm = TRUE), .groups = 'drop')
+ip_dir_sub <- ip_long %>% dplyr::ungroup() %>% dplyr::filter(task_name == 'dir', !is.na(drug)) %>%
+  dplyr::group_by(subNo, drug) %>% dplyr::summarise(IP = mean(IP, na.rm = TRUE), .groups = 'drop')
+effort_sub <- effort_choice_data %>% dplyr::group_by(subNo, drug) %>%
+  dplyr::summarise(p_high = mean(chose_high_effort, na.rm = TRUE), .groups = 'drop')
+pupz_sub   <- pupil_ac %>% dplyr::filter(!is.na(drug)) %>%
+  dplyr::group_by(subNo = subject, drug) %>% dplyr::summarise(pupz = mean(mean_pup, na.rm = TRUE), .groups = 'drop')
+pupraw_sub <- pup_raw_ses %>% dplyr::group_by(subNo = subject, drug) %>%
+  dplyr::summarise(pupraw = mean(mean_raw_pup, na.rm = TRUE), .groups = 'drop')
+
+ttest_tab <- dplyr::bind_rows(
+  paired_t(dev_rt_sub, dev,    'Performance error (deg)'),
+  paired_t(dev_rt_sub, rt,     'Reaction time (s)'),
+  paired_t(ip_sub,     IP,     'IP no-redo (motivation)'),
+  paired_t(ip_sz_sub,  IP,     'IP size (sz1 vs sz3)'),
+  paired_t(ip_dir_sub, IP,     'IP ignore vs update'),
+  paired_t(effort_sub, p_high, 'P(chose high effort)'),
+  paired_t(pupz_sub,   pupz,   'Pupil (z-scored)'),
+  paired_t(pupraw_sub, pupraw, 'Pupil (raw)'))
+print(ttest_tab)
+write.csv(ttest_tab, file.path(deriv_dir, 'drug_paired_ttests.csv'), row.names = FALSE)
+kable(ttest_tab, digits = 3, caption = 'Paired t-tests: propranolol vs placebo (tremor patients)') %>%
+  kable_classic(full_width = FALSE, html_font = 'Cambria')
+```
+Raincloud figures: propranolol vs placebo (ggrain)
+```{r}
+## Raincloud drug-effect figures (PBO vs PROPRANOLOL) using ggrain::geom_rain.
+## Layout per category: jittered points + paired grey lines (left), boxplot (middle),
+## half-violin (right); plus a black line joining the two group means.
+drug_cols <- c('PBO' = '#1b9e77', 'PROPRANOLOL' = '#d95f02')
+
+make_rain <- function(df, yvar, ylab, fname, width = 5.5) {
+  d <- df %>%
+    dplyr::ungroup() %>%
+    dplyr::select(subNo, drug, y = dplyr::all_of(yvar)) %>%
+    dplyr::filter(!is.na(drug), !is.na(y))
+  ## keep only subjects with both sessions so the connecting lines are valid
+  both <- d %>% dplyr::count(subNo) %>% dplyr::filter(n == 2) %>% dplyr::pull(subNo)
+  d <- d %>% dplyr::filter(subNo %in% both) %>%
+    dplyr::mutate(drug = factor(drug, levels = c('PBO', 'PROPRANOLOL')))
+
+  p <- ggplot(d, aes(x = drug, y = y, fill = drug, color = drug)) +
+    ggrain::geom_rain(
+      alpha = .6,
+      id.long.var = 'subNo',
+      point.args = list(alpha = .6, size = 2),
+      line.args = list(alpha = .3, colour = 'grey60'),
+      boxplot.args = list(colour = 'black', outlier.shape = NA, width = .12, alpha = .7),
+      violin.args = list(colour = NA, alpha = .6)) +
+    stat_summary(fun = mean, geom = 'line',  aes(group = 1), colour = 'black', linewidth = .8) +
+    stat_summary(fun = mean, geom = 'point', aes(group = 1), colour = 'black', size = 2.4) +
+    scale_fill_manual(values = drug_cols) +
+    scale_colour_manual(values = drug_cols) +
+    scale_x_discrete(labels = c('PBO' = 'PBO', 'PROPRANOLOL' = 'PROPRANOLOL')) +
+    theme_classic() +
+    labs(x = 'Drug', y = ylab) +
+    theme(legend.position = 'none',
+          axis.title = element_text(size = 15),
+          axis.text  = element_text(size = 12))
+  print(p)
+  ggsave(file.path(deriv_dir, 'figures', fname), plot = p, height = 5, width = width)
+  p
+}
+
+rain_dev <- make_rain(dev_rt_sub, 'dev',  'Performance error (degrees)', 'rain_performance_error_drug.pdf')
+
+## Pupil drug effect by task-type (faceted), mirroring the choice/IP interaction
+## figures. Whole-trial z-scored pupil per subject x drug x task-type, built from
+## the same trial-level frame the models use (cw_t_data).
+pup_type_df <- cw_t_data %>%
+  dplyr::filter(!is.na(drug), !is.na(mean_pup)) %>%
+  dplyr::group_by(subNo, drug, type) %>%
+  dplyr::summarise(pupz = mean(mean_pup, na.rm = TRUE), .groups = 'drop') %>%
+  dplyr::mutate(drug = factor(drug, levels = c('PBO', 'PROPRANOLOL')),
+                type = factor(type, levels = c('Ignore', 'Update')))
+## keep subjects with both drug sessions within each task-type (valid paired lines)
+pup_type_df <- pup_type_df %>%
+  dplyr::group_by(type, subNo) %>% dplyr::filter(dplyr::n() == 2) %>% dplyr::ungroup()
+
+rain_pup_by_type <- ggplot(pup_type_df, aes(x = drug, y = pupz, fill = drug, color = drug)) +
+  ggrain::geom_rain(
+    alpha = .6,
+    id.long.var = 'subNo',
+    point.args = list(alpha = .6, size = 2),
+    line.args = list(alpha = .3, colour = 'grey60'),
+    boxplot.args = list(colour = 'black', outlier.shape = NA, width = .12, alpha = .7),
+    violin.args = list(colour = NA, alpha = .6)) +
+  stat_summary(fun = mean, geom = 'line',  aes(group = 1), colour = 'black', linewidth = .8) +
+  stat_summary(fun = mean, geom = 'point', aes(group = 1), colour = 'black', size = 2.4) +
+  scale_fill_manual(values = drug_cols) +
+  scale_colour_manual(values = drug_cols) +
+  facet_wrap(~ type) +
+  theme_classic() +
+  labs(x = 'Drug', y = 'Mean pupil (z-scored)') +
+  theme(legend.position = 'none',
+        axis.title = element_text(size = 15),
+        axis.text  = element_text(size = 12),
+        strip.text = element_text(size = 13))
+print(rain_pup_by_type)
+ggsave(file.path(deriv_dir, 'figures', 'rain_pupil_drug_by_type.pdf'), plot = rain_pup_by_type, height = 5, width = 8)
+ggsave(file.path(deriv_dir, 'figures', 'rain_pupil_drug_by_type.png'), plot = rain_pup_by_type, height = 5, width = 8, dpi = 120)
+
+
+## Choice-proportion version of the same interaction. This is the measure that
+## carries the SIGNIFICANT drug x task-type effect (P(chose high effort): Ignore
+## PBO->PROP p=.020, Update n.s.), whereas the IP figure above shows it only
+## directionally (IP interaction p=.60). choice==1 = chose the LOW set size,
+## so chose_high = choice==0.
+sz_pchoice_df <- sz_tr_choice_data %>%
+  dplyr::mutate(chose_high = as.integer(choice == 0)) %>%
+  dplyr::group_by(subNo, drug, type) %>%
+  dplyr::summarise(p_high = mean(chose_high, na.rm = TRUE), .groups = 'drop') %>%
+  dplyr::mutate(drug = factor(drug, levels = c('PBO', 'PROPRANOLOL')),
+                type = factor(type, levels = c('Ignore', 'Update')))
+## within each task-type keep only subjects with both drug sessions (valid lines)
+sz_pchoice_df <- sz_pchoice_df %>%
+  dplyr::group_by(type, subNo) %>% dplyr::filter(dplyr::n() == 2) %>% dplyr::ungroup()
+
+cat('\n=== sz P(chose high effort) by drug x task-type (mean, for the figure) ===\n')
+print(as.data.frame(sz_pchoice_df %>% dplyr::group_by(type, drug) %>%
+  dplyr::summarise(p_high = mean(p_high), n = dplyr::n(), .groups = 'drop')))
+
+rain_pchoice_sz <- ggplot(sz_pchoice_df, aes(x = drug, y = p_high, fill = drug, color = drug)) +
+  ggrain::geom_rain(
+    alpha = .6,
+    id.long.var = 'subNo',
+    point.args = list(alpha = .6, size = 2),
+    line.args = list(alpha = .3, colour = 'grey60'),
+    boxplot.args = list(colour = 'black', outlier.shape = NA, width = .12, alpha = .7),
+    violin.args = list(colour = NA, alpha = .6)) +
+  stat_summary(fun = mean, geom = 'line',  aes(group = 1), colour = 'black', linewidth = .8) +
+  stat_summary(fun = mean, geom = 'point', aes(group = 1), colour = 'black', size = 2.4) +
+  scale_fill_manual(values = drug_cols) +
+  scale_colour_manual(values = drug_cols) +
+  facet_wrap(~ type) +
+  theme_classic() +
+  labs(x = 'Drug', y = 'P(chose higher vs lower effort)') +
+  theme(legend.position = 'none',
+        axis.title = element_text(size = 15),
+        axis.text  = element_text(size = 12),
+        strip.text = element_text(size = 14, face = 'bold'))
+print(rain_pchoice_sz)
+ggsave(file.path(deriv_dir, 'figures', 'rain_pchoice_sz_by_type.pdf'), plot = rain_pchoice_sz, height = 5, width = 8)
+ggsave(file.path(deriv_dir, 'figures', 'rain_pchoice_sz_by_type.png'), plot = rain_pchoice_sz, height = 5, width = 8, dpi = 120)
+
+
+
+## Raincloud of reaction time by drug x task-type (Ignore vs Update). Same subject-
+## level aggregation and aesthetic as the choice/deviance rainclouds above; RT is
+## summarised as the per-subject median (robust to the RT skew). Only subjects with
+## both drug sessions within a given task-type contribute a paired line.
+rt_type_df <- cw_t_data %>%
+  dplyr::filter(!is.na(drug)) %>%
+  dplyr::group_by(subNo, drug, type) %>%
+  dplyr::summarise(med_rt = median(rt, na.rm = TRUE), .groups = 'drop') %>%
+  dplyr::mutate(drug = factor(drug, levels = c('PBO', 'PROPRANOLOL')),
+                type = factor(type, levels = c('Ignore', 'Update'))) %>%
+  dplyr::group_by(type, subNo) %>% dplyr::filter(dplyr::n() == 2) %>% dplyr::ungroup()
+
+cat('\n=== median reaction time by drug x task-type (for the figure) ===\n')
+print(as.data.frame(rt_type_df %>% dplyr::group_by(type, drug) %>%
+  dplyr::summarise(med_rt = mean(med_rt), n = dplyr::n(), .groups = 'drop')))
+
+rain_rt_type <- ggplot(rt_type_df, aes(x = drug, y = med_rt, fill = drug, color = drug)) +
+  ggrain::geom_rain(
+    alpha = .6,
+    id.long.var = 'subNo',
+    point.args = list(alpha = .6, size = 2),
+    line.args = list(alpha = .3, colour = 'grey60'),
+    boxplot.args = list(colour = 'black', outlier.shape = NA, width = .12, alpha = .7),
+    violin.args = list(colour = NA, alpha = .6)) +
+  stat_summary(fun = mean, geom = 'line',  aes(group = 1), colour = 'black', linewidth = .8) +
+  stat_summary(fun = mean, geom = 'point', aes(group = 1), colour = 'black', size = 2.4) +
+  scale_fill_manual(values = drug_cols) +
+  scale_colour_manual(values = drug_cols) +
+  facet_wrap(~ type) +
+  theme_classic() +
+  labs(x = 'Drug', y = 'Reaction time (s)') +
+  theme(legend.position = 'none',
+        axis.title = element_text(size = 15),
+        axis.text  = element_text(size = 12),
+        strip.text = element_text(size = 14, face = 'bold'))
+print(rain_rt_type)
+ggsave(file.path(deriv_dir, 'figures', 'rain_rt_drug_by_type.pdf'), plot = rain_rt_type, height = 5, width = 8)
+ggsave(file.path(deriv_dir, 'figures', 'rain_rt_drug_by_type.png'), plot = rain_rt_type, height = 5, width = 8, dpi = 120)
+
+
+
+```
+
+Pupil time-course ribbons (task-type, effort level, drug)
+```{r}
+## Time-course pupil ribbons. The raw traces are summarised once to a small per-subject
+## binned file (pupil_timecourse.csv, cached below) that is read for the plots.
+tc_csv <- file.path(deriv_dir, 'pupil_timecourse.csv')
+if (!file.exists(tc_csv)) {
+  load(file.path(deriv_dir, 'smooth_pupil_data.RData'))
+  pup_tc0 <- smooth_data %>% dplyr::ungroup() %>% dplyr::filter(!is.na(time_bin)) %>%
+    dplyr::group_by(subject, session, phase, type, setSize, time_bin) %>%
+    dplyr::summarise(mean_pup = mean(pupil_z, na.rm = TRUE), mean_raw = mean(smooth_pup, na.rm = TRUE), .groups = 'drop') %>%
+    dplyr::mutate(tbin = as.integer(factor(time_bin)))
+  write.csv(pup_tc0, tc_csv, row.names = FALSE); rm(smooth_data); gc()
+}
+pup_tc <- read.csv(tc_csv) %>%
+  dplyr::mutate(phase  = factor(c('1'='Encoding','2'='Delay','3'='Interference')[as.character(phase)],
+                                levels = c('Encoding','Delay','Interference')),
+                type   = factor(type, levels = c('Ignore','Update')),
+                effort = factor(setSize, levels = c(1, 3), labels = c('Low','High')))
+# session -> drug for tremor patients (non-tremor have no drug)
+drug_long_tc <- drug_list %>% dplyr::select(subNo, drug_ses1, drug_ses2) %>%
+  tidyr::pivot_longer(c(drug_ses1, drug_ses2), names_to = 'session', values_to = 'drug', names_pattern = 'drug_ses(.)') %>%
+  dplyr::mutate(session = as.integer(session))
+pup_tc <- pup_tc %>% dplyr::left_join(drug_long_tc, by = c('subject'='subNo','session'))
+
+# --- TREMOR-DOMINANT ONLY. The non-tremor group is dropped from the manuscript, so every
+# time-course pupil analysis below (ribbons, binned LMMs, interference maintenance) is
+# restricted to tremor-dominant patients here at the source. ---
+td_ids_pup <- part_char %>% dplyr::filter(Tremor_dominant == 'Yes') %>%
+  dplyr::pull(SubNr) %>% as.numeric()
+pup_tc <- pup_tc %>% dplyr::filter(subject %in% td_ids_pup)
+
+tc_time_labels <- as.character(seq(0.2, 2, 0.2))
+# Cousineau-Morey within-subject SE: for each (time, phase) cell, subtract each subject's
+# mean across the plotted within-subject conditions and add back the grand mean, then take
+# the SE across subjects with the Morey correction sqrt(M/(M-1)) for M conditions. This
+# removes the large between-subject pupil-size spread so the ribbon bands reflect the
+# WITHIN-subject contrast (effort, task-type, drug -- all repeated within subject). NOT for
+# the between-subjects group ribbon, where the between-subject spread IS the effect.
+within_se <- function(agg, pos, cond) {
+  M <- nrow(dplyr::distinct(agg, dplyr::across(dplyr::all_of(cond))))
+  agg %>%
+    dplyr::group_by(dplyr::across(dplyr::all_of(pos))) %>%
+    dplyr::mutate(gm = mean(val, na.rm = TRUE)) %>%
+    dplyr::group_by(dplyr::across(dplyr::all_of(c('subject', pos)))) %>%
+    dplyr::mutate(sm = mean(val, na.rm = TRUE)) %>%
+    dplyr::ungroup() %>%
+    dplyr::mutate(val_n = val - sm + gm) %>%
+    dplyr::group_by(dplyr::across(dplyr::all_of(c(pos, cond)))) %>%
+    dplyr::summarise(val = mean(val, na.rm = TRUE),
+                     se  = sqrt(M / (M - 1)) * sd(val_n, na.rm = TRUE) / sqrt(dplyr::n()),
+                     .groups = 'drop')
+}
+ribbon_pupil <- function(df, gv, cols, glab, fname, yvar = 'mean_pup', ylab = 'Mean pupil (z-scored)') {
+  df <- df %>% dplyr::filter(!is.na(.data[[gv]]), !is.na(.data[[yvar]]))
+  # one value per subject per (tbin, phase, gv) cell, then a within-subject (Cousineau-
+  # Morey) SE per cell -- gv (effort/task-type/drug) is a within-subject factor.
+  agg <- df %>% dplyr::group_by(dplyr::across(dplyr::all_of(c('subject','tbin','phase', gv)))) %>%
+    dplyr::summarise(val = mean(.data[[yvar]], na.rm = TRUE), .groups = 'drop')
+  s <- within_se(agg, pos = c('tbin','phase'), cond = gv)
+  s$tbin <- as.numeric(as.character(s$tbin))
+  p <- ggplot(s, aes(x = tbin, y = val, ymin = val - se, ymax = val + se,
+                     colour = .data[[gv]], fill = .data[[gv]])) +
+    geom_line(linewidth = 1) + geom_ribbon(alpha = .35, colour = NA) +
+    facet_wrap(~ phase) + scale_x_continuous(breaks = 1:10, labels = tc_time_labels) +
+    scale_colour_manual(values = cols, name = glab) + scale_fill_manual(values = cols, name = glab) +
+    theme_classic() + labs(x = 'Time (s)', y = ylab) +
+    theme(axis.title = element_text(size = 14), strip.text = element_text(size = 12), legend.position = 'top')
+  print(p)
+  ggsave(file.path(deriv_dir, 'figures', fname), plot = p, height = 4.5, width = 11)
+  ggsave(file.path(deriv_dir, 'figures', sub('\\.pdf$', '.png', fname)), plot = p, height = 4.5, width = 11, dpi = 120)
+  p
+}
+# z-scored ribbons (per-subject z pupil -> between-subject/group SIZE removed)
+rib_type   <- ribbon_pupil(pup_tc, 'type',   c('Ignore'='#126192','Update'='#e41e52'), 'Task-type',    'ribbon_pupil_type.pdf')
+rib_effort <- ribbon_pupil(pup_tc, 'effort', c('Low'='#2ca02c','High'='#9467bd'),      'Effort level', 'ribbon_pupil_effort.pdf')
+rib_drug   <- ribbon_pupil(pup_tc, 'drug',   drug_cols,                                 'Drug',         'ribbon_pupil_drug.pdf')
+# raw ribbons (smooth_pup -> retains between-subject/group size differences)
+
+# --- Table representing the ribbons (tremor-dominant only): mixed model on the binned
+# time-course pupil (averaged over time within phase), with effort and task-type modulated
+# across phases. The non-tremor group is dropped, so this is no longer a between-group table
+# -- it characterises how the pupil tracks effort level and task-type (and how that differs
+# across encoding/delay/interference) within the tremor-dominant sample. Reported on the
+# z-scored (per-subject size-normalised = response SHAPE) signal; the raw-scaling companion
+# table was dropped (it added only absolute-size information, redundant with Figure 3A). ---
+ribbon_cell <- function(yvar) pup_tc %>%
+  dplyr::filter(!is.na(type), !is.na(effort), !is.na(.data[[yvar]])) %>%
+  dplyr::group_by(subject, phase, type, effort) %>%
+  dplyr::summarise(val = mean(.data[[yvar]], na.rm = TRUE), .groups = 'drop')
+pupil_ribbon_lmm <- lmer(val ~ effort*phase + type*phase + (1|subject), data = ribbon_cell('mean_pup'))
+make_tab(model = pupil_ribbon_lmm, title = 'Supplemental Table 3. Pupil (z-scored) effort and task-type across phases', directory = deriv_dir, dv_labels = 'Pupil (z-scored)')
+
+# --- 4-ribbon time-course: effort (Low/High) x task-type (Ignore/Update), tremor-dominant.
+# Task-type palette (Ignore #126192, Update #e41e52); low-effort ribbons much paler +
+# dashed lines, high-effort solid. Faceted by phase. One for z-scored, one for raw. ---
+type_cols <- c('Ignore' = '#126192', 'Update' = '#e41e52')
+four_ribbon <- function(yvar, ylab, fname) {
+  agg <- pup_tc %>% dplyr::filter(!is.na(type), !is.na(effort), !is.na(.data[[yvar]])) %>%
+    dplyr::group_by(subject, tbin, phase, type, effort) %>%
+    dplyr::summarise(val = mean(.data[[yvar]], na.rm = TRUE), .groups = 'drop')
+  s <- within_se(agg, pos = c('tbin','phase'), cond = c('type','effort'))  # 4 within-subject cells
+  s$tbin <- as.numeric(as.character(s$tbin))
+  p <- ggplot(s, aes(tbin, val, colour = type, group = interaction(type, effort))) +
+    geom_ribbon(aes(ymin = val - se, ymax = val + se, fill = type, alpha = effort), colour = NA) +
+    geom_line(aes(linetype = effort), linewidth = 1) +
+    facet_wrap(~ phase) + scale_x_continuous(breaks = 1:10, labels = tc_time_labels) +
+    scale_colour_manual(values = type_cols, name = 'Task-type') +
+    scale_fill_manual(values = type_cols, name = 'Task-type') +
+    scale_alpha_manual(values = c('Low' = 0.20, 'High' = 0.70), guide = 'none') +
+    scale_linetype_manual(values = c('Low' = 'dashed', 'High' = 'solid'), name = 'Effort') +
+    theme_classic() + labs(x = 'Time (s)', y = ylab) +
+    theme(axis.title = element_text(size = 14), strip.text = element_text(size = 12), legend.position = 'top')
+  print(p)
+  ggsave(file.path(deriv_dir, 'figures', fname), plot = p, height = 4.5, width = 11)
+  ggsave(file.path(deriv_dir, 'figures', sub('\\.pdf$', '.png', fname)), plot = p, height = 4.5, width = 11, dpi = 120)
+  p
+}
+rib_effort_type     <- four_ribbon('mean_pup', 'Mean pupil (z-scored)', 'ribbon_pupil_effort_type.pdf')
+
+# --- TREMOR-DOMINANT figure statistics. Figure 3 A/B (effort effect, task-type interference
+# maintenance) are reported within the tremor-dominant sample (the non-tremor group is dropped
+# from the manuscript). Whole-trial model parallels fit_pupil() but collapses over drug (both
+# sessions pooled), adjusting for UPDRS, age and sex with by-subject random intercepts. ---
+cw_all_data <- cw_data_char %>% dplyr::filter(tremor_group == 'Yes', !is.na(mean_pup)) %>%
+  dplyr::mutate(age_z = as.numeric(ave(Age, FUN = scale)),
+                updrs_z = as.numeric(ave(updrs_total, FUN = scale)))
+fit_all <- function(dv) lmer(as.formula(paste0(dv, ' ~ setSize*type + updrs_z + age_z + Gender + (1|subNo)')),
+                             data = cw_all_data, control = lmerControl(optimizer = 'bobyqa', optCtrl = list(maxfun = 2e5)))
+pupil_all_z   <- fit_all('mean_pup')
+pupil_all_raw <- fit_all('mean_raw_pup')
+report_terms <- function(m, lab){ cf <- summary(m)$coefficients
+  eff  <- grep('^setSize', rownames(cf), value = TRUE); eff <- eff[!grepl(':', eff)][1]
+  intx <- grep('^setSize.*:type', rownames(cf), value = TRUE)[1]
+  for(t in c(eff, intx)){ i <- which(rownames(cf) == t)
+    if(length(i)) cat(sprintf('  %-4s %-22s b=%.3f  t=%.2f  p=%.4g  (N subj=%d)\n',
+        lab, t, cf[i,1], cf[i,'t value'], 2*pnorm(-abs(cf[i,'t value'])), lme4::ngrps(m)[['subNo']])) } }
+cat('\n=== TREMOR-DOMINANT whole-trial pupil (Figure 3A effort main + effort x task-type) ===\n')
+report_terms(pupil_all_z, 'z'); report_terms(pupil_all_raw, 'raw')
+
+# Interference maintenance (Figure 3B), tremor-dominant: task-type x time slope + late-window
+# (tbin>=7, ~1.2-2 s) Ignore-vs-Update paired contrast, from the ribbon time-course (pup_tc).
+int_tc <- pup_tc %>% dplyr::filter(phase == 'Interference', !is.na(type), !is.na(mean_pup)) %>%
+  dplyr::group_by(subject, type, tbin) %>% dplyr::summarise(mp = mean(mean_pup, na.rm = TRUE), .groups = 'drop')
+m_int <- lmer(mp ~ type * tbin + (1|subject), data = int_tc)
+ci <- summary(m_int)$coefficients; rti <- grep('type.*:tbin|tbin:type', rownames(ci), value = TRUE)[1]
+late_int <- int_tc %>% dplyr::filter(tbin >= 7) %>% dplyr::group_by(subject, type) %>%
+  dplyr::summarise(mp = mean(mp, na.rm = TRUE), .groups = 'drop') %>%
+  tidyr::pivot_wider(names_from = type, values_from = mp) %>% dplyr::filter(!is.na(Ignore), !is.na(Update))
+tt_int <- t.test(late_int$Ignore, late_int$Update, paired = TRUE)
+cat('\n=== TREMOR-DOMINANT interference maintenance (Figure 3B) ===\n')
+cat(sprintf('  task-type x time (%s): b=%.3f t=%.2f p=%.4g\n', rti, ci[rti,1], ci[rti,'t value'], 2*pnorm(-abs(ci[rti,'t value']))))
+cat(sprintf('  late window (tbin>=7): Ignore=%.2f Update=%.2f  Delta=%.2f  t(%d)=%.2f  p=%.4g\n',
+    mean(late_int$Ignore), mean(late_int$Update), mean(late_int$Ignore - late_int$Update),
+    tt_int$parameter, tt_int$statistic, tt_int$p.value))
+
+# --- Eye-tracking availability among tremor-dominant patients (fills the "X participants
+# lacking eye-tracking" placeholder in the Participants section). Count TD subjects with
+# behavioural (colour-wheel) data vs those with any pupil data. ---
+td_char <- cw_data_char %>% dplyr::filter(tremor_group == 'Yes')
+n_td_beh <- dplyr::n_distinct(td_char$subNo)
+n_td_pup <- dplyr::n_distinct(td_char$subNo[!is.na(td_char$mean_pup)])
+cat(sprintf('\n=== Eye-tracking availability (tremor-dominant) ===\n  TD with behaviour=%d, TD with pupil=%d, lacking eye-tracking=%d\n',
+    n_td_beh, n_td_pup, n_td_beh - n_td_pup))
+cat('  TD subNo lacking pupil:', paste(sort(setdiff(unique(td_char$subNo), unique(td_char$subNo[!is.na(td_char$mean_pup)]))), collapse = ', '), '\n')
+```
+
+Supplemental Table 2. Task-type (Ignore vs Update) effects in the full sample
+```{r tasktype_full_sample, message=FALSE, warning=FALSE}
+## Full-sample sensitivity for the task-type (Ignore vs Update) effects reported in the
+## main text (which use the n=26 two-session crossover sample). Here we pool ALL
+## tremor-dominant patients and ALL their available trials -- adding the one-session /
+## excluded patients -- with NO drug term, matching how the full-sample pupil task-effect
+## models (Figure 3A) treat sessions. Deviation-coded type_dev (Update +0.5, Ignore -0.5),
+## so its coefficient is the marginal Update-vs-Ignore effect. Performance error and RT are
+## LMMs; high-effort choice (nr+sz pooled) is a binomial GLMM (task_dev = nr vs sz nuisance).
+tt_perf <- cw_data_char %>% dplyr::filter(tremor_group == 'Yes', !is.na(dev)) %>%
+  dplyr::mutate(effort_dev = ifelse(setSize == 3, 0.5, -0.5),
+                type_dev   = ifelse(as.character(type) == 'Update', 0.5, -0.5))
+tt_choice <- effort_choice_data %>%
+  dplyr::mutate(type_dev = ifelse(as.character(type) == 'Update', 0.5, -0.5),
+                task_dev = ifelse(task_name == 'sz', 0.5, -0.5))
+m_tt_dev <- lmerTest::lmer(dev ~ effort_dev*type_dev + scale(updrs_total) + scale(Age) + Gender + (1|subNo),
+                           data = tt_perf, control = lmerControl(optimizer = 'bobyqa'))
+m_tt_rt  <- lmerTest::lmer(rt  ~ effort_dev*type_dev + scale(updrs_total) + scale(Age) + Gender + (1|subNo),
+                           data = tt_perf %>% dplyr::filter(!is.na(rt)), control = lmerControl(optimizer = 'bobyqa'))
+m_tt_ch  <- glmer(chose_high_effort ~ type_dev + task_dev + scale(easyOffer) + scale(updrs_total) + scale(Age) + Gender + (1|subNo),
+                  data = tt_choice, family = binomial, control = glmerControl(optimizer = 'bobyqa', optCtrl = list(maxfun = 2e5)))
+tt_row <- function(m, lab, logistic = FALSE){ co <- summary(m)$coefficients; r <- 'type_dev'
+  # lmerTest lmer cols = Estimate, Std.Error, df, t value, Pr; glmer = Estimate, Std.Error, z value, Pr.
+  # Pick the test-statistic column by name so we report t/z, not df.
+  stat_col <- if ('t value' %in% colnames(co)) 't value' else if ('z value' %in% colnames(co)) 'z value' else 3
+  b <- co[r,1]; s <- co[r,2]; st <- co[r, stat_col]; p <- if (logistic) 2*pnorm(-abs(st)) else co[r, ncol(co)]
+  est <- if (logistic) sprintf('OR = %.2f [%.2f, %.2f]', exp(b), exp(b-1.96*s), exp(b+1.96*s))
+         else           sprintf('%.2f [%.2f, %.2f]', b, b-1.96*s, b+1.96*s)
+  data.frame(Outcome = lab, `Subjects` = lme4::ngrps(m)[['subNo']],
+             `Update vs Ignore` = est, Statistic = sprintf('%s = %.2f', if(logistic)'z' else 't', st),
+             p = ifelse(p < .001, '< .001', sub('^0','', sprintf('%.3f', p))), check.names = FALSE) }
+tasktype_full <- rbind(
+  tt_row(m_tt_dev, 'Performance error (degrees)'),
+  tt_row(m_tt_rt,  'Reaction time (s)'),
+  tt_row(m_tt_ch,  'High-effort choice', logistic = TRUE))
+cat('\n=== Task-type (Update vs Ignore) effects, FULL tremor-dominant sample ===\n'); print(tasktype_full, row.names = FALSE)
+write.csv(tasktype_full, file.path(deriv_dir, 'tasktype_full_sample.csv'), row.names = FALSE)
+kt_tt <- kable(tasktype_full, format = 'html', align = c('l','c','c','c','c'),
+      caption = 'Supplemental Table 2. Task-type (Update vs Ignore) effects in the full sample') %>%
+  kable_classic(full_width = FALSE, html_font = 'Cambria') %>%
+  kableExtra::footnote(general = 'All patients, all available sessions; no drug term. Positive error/RT = higher for Update; OR > 1 = greater willingness to exert effort for Update.',
+                       general_title = 'Note. ', footnote_as_chunk = TRUE)
+# render a PNG (guarded) so it saves to figures/ like the other supplemental tables;
+# add a rule under the title and above the Note, matching Table 1's styling.
+tryCatch({
+  tmp_tt <- tempfile(fileext = '.html')
+  full_tt <- paste0('<!DOCTYPE html><html><head><meta charset="utf-8">',
+                    '<style>caption{text-align:left !important;padding-left:0;',
+                    'border-bottom:1.5px solid #000;padding-bottom:5px;margin-bottom:2px;}',
+                    'tfoot td{border-top:1.5px solid #000 !important;padding-top:5px;}</style></head><body>',
+                    as.character(kt_tt), '</body></html>')
+  ctt <- file(tmp_tt, encoding = 'UTF-8'); writeLines(full_tt, ctt, useBytes = FALSE); close(ctt)
+  webshot::webshot(paste0('file:///', gsub('\\\\', '/', normalizePath(tmp_tt))),
+                   file.path(deriv_dir, 'figures', 'supplemental_table_2_task-type_full_sample.png'),
+                   zoom = 2, selector = 'table')
+  unlink(tmp_tt)
+}, error = function(err) cat('Supp Table 2 PNG render skipped:', conditionMessage(err), '\n'))
+kt_tt
+```
+
+Supplemental Table 6 & Figure. Exploratory correlations of the propranolol effects with clinical measures
+```{r drug_symptom_correlations, message=FALSE, warning=FALSE}
+## EXPLORATORY: does the size of each propranolol effect scale with disease burden? The
+## per-subject drug effect = the drug_dev slope from each already-fitted model
+## (coef(model)$subNo['drug_dev']): motivation (effort_drug_int), performance error (devL),
+## reaction time (rtLni). Correlated with each clinical measure using KENDALL's tau (rank,
+## robust to outliers, appropriate for small n and ordinal/skewed clinical scores).
+## Exploratory and uncorrected; predictors are collinear (UPDRS / LEDD / disease duration).
+psc_de <- function(m){ cs <- coef(m)$subNo['drug_dev']; data.frame(subNo = as.numeric(rownames(cs)), eff = cs[,1]) }
+de_effs <- list('Motivation (high-effort choice)' = psc_de(effort_drug_int),
+                'Performance error'               = psc_de(devL),
+                'Reaction time'                   = psc_de(rtLni))
+de_sym <- part_char %>% dplyr::transmute(subNo = as.numeric(SubNr),
+  `MDS-UPDRS III` = as.numeric(UPDRS_total),
+  `MDS-UPDRS III tremor subscore` = as.numeric(UPDRS_total_tremor),
+  `MDS-UPDRS III non-tremor subscore` = as.numeric(UPDRS_total_non_tremor),
+  `MMSE` = as.numeric(MMSE_score),
+  `LEDD (mg)` = as.numeric(LEDD),
+  `Disease duration (years)` = as.numeric(Disease_duration))
+de_symcols <- setdiff(names(de_sym), 'subNo')
+ktau <- function(x, y){ d <- data.frame(x, y); d <- d[stats::complete.cases(d), ]
+  k <- suppressWarnings(cor.test(d$x, d$y, method = 'kendall'))
+  c(tau = unname(k$estimate), p = k$p.value, n = nrow(d)) }
+de_long <- do.call(rbind, lapply(names(de_effs), function(en){ dat <- dplyr::left_join(de_effs[[en]], de_sym, by = 'subNo')
+  do.call(rbind, lapply(de_symcols, function(s){ v <- ktau(dat$eff, dat[[s]])
+    data.frame(effect = en, symptom = s, n = v['n'], tau = round(v['tau'],3), p = round(v['p'],4), row.names = NULL) })) }))
+con_ds <- file(file.path(deriv_dir, 'drug_symptom_kendall.csv'), encoding = 'UTF-8')
+write.csv(de_long, con_ds, row.names = FALSE)
+cat('\n=== Propranolol effect x clinical measure (Kendall tau) ===\n'); print(de_long, row.names = FALSE)
+
+# --- Supplemental Table 6: matrix rows = clinical measure, cols = drug effect, cell = tau (p) ---
+pfmt_ds <- function(p) ifelse(p < .001, '< .001', sub('^0', '', sprintf('%.3f', p)))
+de_mat <- de_long %>% dplyr::mutate(cell = sprintf('%.2f (%s)', tau, pfmt_ds(p))) %>%
+  dplyr::select(effect, symptom, cell) %>% tidyr::pivot_wider(names_from = effect, values_from = cell)
+de_mat <- de_mat[match(de_symcols, de_mat$symptom), ]; names(de_mat)[1] <- 'Clinical measure'
+kt_ds <- kable(de_mat, format = 'html', align = c('l','c','c','c'),
+      caption = 'Supplemental Table 6. Correlations of the propranolol effects with clinical measures') %>%
+  kable_classic(full_width = FALSE, html_font = 'Cambria') %>%
+  kableExtra::column_spec(1, width = '6cm') %>%
+  kableExtra::footnote(general = 'Values are Kendall’s τ (p). Each cell correlates the per-subject propranolol effect (drug slope from the corresponding mixed model) with the clinical measure; n = 24 (motivation) or 26 (performance error, reaction time). Exploratory and uncorrected for multiple comparisons.',
+                       general_title = 'Note. ', footnote_as_chunk = TRUE)
+tryCatch({
+  tmp_ds <- tempfile(fileext = '.html')
+  full_ds <- paste0('<!DOCTYPE html><html><head><meta charset="utf-8">',
+                    '<style>caption{text-align:left !important;padding-left:0;',
+                    'border-bottom:1.5px solid #000;padding-bottom:5px;margin-bottom:2px;}',
+                    'tfoot td{border-top:1.5px solid #000 !important;padding-top:5px;}</style></head><body>',
+                    as.character(kt_ds), '</body></html>')
+  cds <- file(tmp_ds, encoding = 'UTF-8'); writeLines(full_ds, cds, useBytes = FALSE); close(cds)
+  webshot::webshot(paste0('file:///', gsub('\\\\', '/', normalizePath(tmp_ds))),
+                   file.path(deriv_dir, 'figures', 'supplemental_table_6_drug_symptom_correlations.png'),
+                   zoom = 2, selector = 'table')
+  unlink(tmp_ds)
+}, error = function(err) cat('Supp Table 6 PNG render skipped:', conditionMessage(err), '\n'))
+
+# --- Supplemental Figure: scatter of per-subject drug effect vs each clinical measure,
+# one PNG per drug effect, all six measures faceted, dashed zero line, Kendall tau annotated. ---
+de_mk <- function(dfobj, ylab, col, fname){
+  dat  <- dplyr::left_join(dfobj, de_sym, by = 'subNo')
+  long <- tidyr::pivot_longer(dat, dplyr::all_of(de_symcols), names_to = 'measure', values_to = 'value') %>%
+    dplyr::mutate(measure = factor(measure, levels = de_symcols))
+  ann <- do.call(rbind, lapply(de_symcols, function(s){ v <- ktau(dat$eff, dat[[s]])
+    data.frame(measure = factor(s, levels = de_symcols),
+               label = sprintf('Kendall τ = %.2f\np = %s', v['tau'], pfmt_ds(v['p']))) }))
+  p <- ggpubr::ggscatter(long, x = 'value', y = 'eff', add = 'reg.line', conf.int = TRUE,
+                 add.params = list(color = col, fill = 'grey85'), color = col, size = 2.2, alpha = .65,
+                 facet.by = 'measure', scales = 'free_x') +
+    ggplot2::geom_hline(yintercept = 0, linetype = 'dashed', colour = 'grey65', linewidth = .35) +
+    ggplot2::geom_text(data = ann, ggplot2::aes(x = -Inf, y = Inf, label = label), inherit.aes = FALSE,
+              hjust = -0.08, vjust = 1.25, size = 3.1, colour = 'grey25', lineheight = .95) +
+    ggplot2::labs(x = 'Clinical measure', y = ylab) +
+    ggplot2::theme(strip.text = ggplot2::element_text(face = 'bold', size = 10.5),
+                   axis.title = ggplot2::element_text(size = 12),
+                   panel.spacing = ggplot2::unit(0.9, 'lines'))
+  print(p)
+  ggsave(file.path(deriv_dir, 'figures', fname), plot = p, height = 6, width = 10.5, dpi = 150) }
+de_mk(de_effs[[1]], 'Propranolol effect on high-effort choice (logit)', '#e41e52', 'drug_motivation_symptom_scatter.png')
+de_mk(de_effs[[2]], 'Propranolol effect on performance error (degrees)', '#126192', 'drug_error_symptom_scatter.png')
+de_mk(de_effs[[3]], 'Propranolol effect on reaction time (s)',           '#2ca02c', 'drug_rt_symptom_scatter.png')
+```
