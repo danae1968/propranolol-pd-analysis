@@ -1,4 +1,4 @@
-# Propranolol, cognitive effort and pupillometry in Parkinson's disease
+# Propranolol enhances motivation for cognitive stability in tremor-dominant Parkinson’s disease
 
 Analysis code for a double-blind, placebo-controlled, within-subject **crossover study** of the
 β-adrenergic antagonist **propranolol** (40 mg) in **tremor-dominant Parkinson's disease**. The
@@ -10,6 +10,14 @@ Patients completed, on placebo and on propranolol:
 - a **colour-wheel working-memory task** crossing *effort level* (low vs high load) with
   *task-type* (resisting distraction vs flexibly updating memory), with simultaneous **pupillometry**;
 - a **cognitive effort-discounting task** measuring willingness to repeat each kind of effort for reward.
+
+## Key findings
+
+- Propranolol **increased willingness to exert cognitive effort**, most clearly for the
+  distractor-resistance (cognitive-stability) demand.
+- It **modestly improved working-memory accuracy**, with a reaction-time slowing specific to the same condition.
+- It **did not change task-evoked pupil size**, even though pupil tracked effort and task-type.
+- Exploratorily, **higher working-memory pupil predicted lower subsequent effort choice**.
 
 ## What this repository shows
 
@@ -79,8 +87,8 @@ environment variable to the repository root). Bayesian models are fit once and c
 
 ## Reference
 
-Papadopetraki et al. (in preparation). *Noradrenergic modulation of cognitive effort in
-tremor-dominant Parkinson's disease.*
+Papadopetraki et al. (in preparation). *Propranolol enhances motivation for cognitive
+stability in tremor-dominant Parkinson’s disease.*
 
 ## Author
 
