@@ -62,8 +62,7 @@ The analysis notebook runs in sections that mirror the paper:
 
 ## Data availability
 
-The behavioural, pupillometry and clinical (MDS-UPDRS, demographic) data are **sensitive patient
-data and are not included** in this repository. They are available from the authors on reasonable
+Data available from the authors on reasonable
 request, subject to the study's data-sharing agreement and ethics approval. To run the code, place
 the derivative files in `Data/derivatives/` under the repository root (the notebook reads from there).
 
@@ -92,4 +91,4 @@ stability in tremor-dominant Parkinson’s disease.*
 
 ## Author
 
-Danae Papadopetraki
+Danae Papadopetraki; README by Claude
